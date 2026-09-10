@@ -179,14 +179,38 @@ multi-hop reasoning than `qwen3:14b` reliably provides — see section 7.
 
 ```bash
 pip install shell-gpt --break-system-packages
-
-export OPENAI_API_BASE=http://localhost:11434/v1
-export OPENAI_API_KEY=ollama
-export SGPT_DEFAULT_MODEL=qwen2.5-coder:7b
 ```
 
-Add these exports to `~/.bashrc` (or your WSL shell profile) so they
-persist.
+shell-gpt does **not** read `OPENAI_API_BASE` as an environment variable —
+it needs the base URL set via its own config key, `API_BASE_URL`, in its
+config file. Setting only env vars (as an earlier version of this guide
+suggested) will silently fall through to OpenAI's real endpoint and fail
+with a 401, since it tries your local placeholder key against the real API.
+
+```bash
+mkdir -p ~/.config/shell_gpt
+cat > ~/.config/shell_gpt/.sgptrc << 'EOF'
+API_BASE_URL=http://localhost:11434/v1
+OPENAI_API_KEY=ollama
+DEFAULT_MODEL=qwen2.5-coder:7b
+CHAT_CACHE_LENGTH=100
+CHAT_CACHE_PATH=/tmp/shell_gpt/chat_cache
+CACHE_LENGTH=100
+CACHE_PATH=/tmp/shell_gpt/cache
+REQUEST_TIMEOUT=60
+DEFAULT_COLOR=magenta
+DISABLE_STREAMING=false
+PRETTIFY_MARKDOWN=true
+SHELL_INTERACTION=true
+OS_NAME=auto
+SHELL_NAME=auto
+EOF
+```
+
+If `~/.config/shell_gpt/.sgptrc` already exists with different content,
+check it first (`cat ~/.config/shell_gpt/.sgptrc`) rather than overwriting
+blindly — just make sure `API_BASE_URL` and `DEFAULT_MODEL` are set as
+above.
 
 ```bash
 sgpt "explain this renovate.json error: <paste>"
@@ -195,6 +219,11 @@ sgpt "explain this renovate.json error: <paste>"
 Note: `sgpt` is stateless and doesn't get the system prompt or web-search
 setup below — it's a plain, fast Q&A path for quick lookups. Use Open WebUI
 when you want the docs-first/web-fallback behavior with citations.
+
+shell-gpt's own maintainers note it's *"not optimized for local models and
+may not work as expected"* — if you hit odd formatting or streaming
+glitches beyond the auth issue above, that's a known limitation of the
+tool itself.
 
 ---
 
@@ -405,4 +434,112 @@ it. This is why it's a second model, not your default.
 Both models will now appear in the chat model dropdown — use `qwen3:14b`
 by default, and switch to the 30B model for questions that need deeper
 synthesis across multiple retrieved facts.
+
+---
+
+## 8. Optional: reasoning-tuned variant of the 14B model (thinking mode)
+
+`qwen3-coder:30b` has no thinking mode at all — `qwen3:14b` does, and
+you've likely never turned it on. This is the more direct fix for
+multi-hop reasoning gaps (e.g. the Renovate `fileMatch`/`ignorePaths`
+case) than the 30B model: no new pull, stays fully in VRAM, and Qwen3's
+thinking mode is purpose-built for exactly this kind of "combine two
+facts into a conclusion" task. Add it as a **third** model alongside your
+existing `qwen3:14b` and `qwen3-coder:30b` — use it specifically for
+questions that need synthesis, keep the fast model as your default.
+
+No pull needed — same `qwen3:14b` weights, different system prompt and
+sampling profile.
+
+### Add it as a third model in Open WebUI
+
+**Workspace → Models → `+`**
+
+- **Name**: `DevOps Assistant (docs-first, 14B-reasoning)`
+- **Base Model**: `qwen3:14b`
+- **System Prompt** — start with `/think` to force thinking mode every
+  turn (documented behavior: Qwen3 honors `/think`/`/no_think` placed in
+  either the system message or user turns, following the most recent
+  instruction), followed by the same rules 1–9 as your other models, plus
+  a new rule 10 that shapes what appears in the *visible* answer after
+  the model's internal reasoning:
+
+```
+/think
+
+You are a DevOps assistant. You have a web search tool. You do NOT have a local/offline document store - all documentation lookups happen live via web search.
+
+PRIORITY OFFICIAL DOMAINS (search these first / prefer results from these):
+- docs.renovatebot.com
+- docs.github.com, cli.github.com
+- docs.python.org
+- gnu.org/software/bash
+- developer.hashicorp.com/terraform, registry.terraform.io
+- kubernetes.io/docs, kubectl reference at kubernetes.io/docs/reference/kubectl
+- cloud.google.com/docs
+- docs.docker.com
+- helm.sh/docs
+- docs.ansible.com
+- terragrunt.gruntwork.io/docs
+- argo-cd.readthedocs.io
+- prometheus.io/docs, grafana.com/docs
+- pre-commit.com
+- mikefarah.gitbook.io/yq, jqlang.org
+- github.com/getsops/sops, developer.hashicorp.com/vault/docs
+
+RULES, in order, every time:
+
+1. For any factual/technical question, search the web, prioritizing the domains above. Do not answer from prior/training knowledge alone - always search first, even if you think you know the answer, since docs and APIs change.
+
+2. If you find the answer on one of the priority domains: tag the answer [DOCS]. Include the exact page URL, and a short exact quoted snippet (one sentence or less) from the page that supports the claim. Do not paraphrase the quote into something the page didn't say. If you can't produce a real supporting quote + URL, you don't have grounding - don't use the [DOCS] tag.
+
+3. If the priority domains don't have it, search the broader web. Tag that answer [WEB], include the source URL, and still quote the specific supporting snippet where possible.
+
+4. If neither search turns up a supported answer, say so plainly: 'Not found in official documentation or general web search.' Do not guess or fill the gap from memory.
+
+5. Never blend an unsourced claim into a [DOCS] or [WEB] answer. Every distinct factual claim needs its own source. If an answer draws on multiple sources, tag and cite each part separately.
+
+6. Be concise. Quote only the minimum needed to support each claim - do not reproduce large blocks of the source page.
+
+7. When the official docs are ambiguous or you find conflicting info between sources, say so explicitly rather than picking one silently.
+
+8. Only cite a URL if it appears verbatim in the search results returned to you this turn. Never construct, complete, or guess a URL from memory, even if you recognize the site's typical structure or have seen similar URLs during training. If you are not certain a URL is one you actually retrieved this turn, omit the citation and say the specific page could not be confirmed, rather than presenting an unverified URL as a source.
+
+9. When a question involves how two configuration behaviors interact (e.g. whether one setting overrides or adds to another), explicitly state which it is and name the correct option to achieve the user's actual goal, before giving your final answer. Do not stop at restating a single retrieved fact if the practical implication requires combining it with another.
+
+10. Before giving your final answer to a question that requires connecting more than one fact, explicitly write out: (a) each relevant fact you found, with its source, (b) how those facts interact or constrain each other, (c) the practical conclusion or recommendation that follows. Only then give the final answer.
+```
+
+- **Advanced Params** — use Qwen's own recommended sampling profile for
+  thinking mode, not the low-temperature profile from your other models
+  (low temperature actively degrades thinking-mode output — Qwen's
+  guidance warns it causes repetition or getting stuck):
+  - `temperature`: `0.6`
+  - `top_p`: `0.95`
+  - `top_k`: `20`
+  - `repeat_penalty`: `1`
+  - `num_ctx`: `16384` (or higher if you have headroom — thinking traces
+    are verbose)
+  - `num_predict` / max tokens: raise this above whatever your other
+    models use, or leave unlimited — a capped budget can cut the response
+    off mid-reasoning before it ever reaches the visible answer.
+  - `Function Calling`: `Native`
+- Same capability checkboxes as section 5.
+
+### Why this profile differs from your other two models
+
+Your `qwen3:14b` fast-default and `qwen3-coder:30b` models are both tuned
+low-temperature (`0.15`) for citation determinism — appropriate for
+straightforward lookups where you want the same reliable answer every
+time. This third model trades that off deliberately: higher temperature
+and thinking mode both add variability and latency, in exchange for
+actually working through multi-fact problems instead of stopping at the
+first true statement. Use it selectively, not as your default.
+
+You'll now have three models in the dropdown:
+- `qwen3:14b` — fast default, low-temperature, no thinking.
+- `qwen3-coder:30b` — heavier, better raw code quality, no thinking mode.
+- `qwen3:14b` (reasoning variant) — same weights as the default, but
+  thinking-mode on with Qwen's recommended sampling, for questions that
+  need facts connected rather than just retrieved.
 
