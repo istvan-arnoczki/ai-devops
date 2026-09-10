@@ -71,8 +71,8 @@ services:
       - ENABLE_RAG_WEB_SEARCH=true
       - RAG_WEB_SEARCH_ENGINE=searxng
       - SEARXNG_QUERY_URL=http://searxng:8080/search?q=<query>&format=json
-      - RAG_WEB_SEARCH_RESULT_COUNT=6
-      - RAG_WEB_SEARCH_CONCURRENT_REQUESTS=6
+      - RAG_WEB_SEARCH_RESULT_COUNT=4
+      - RAG_WEB_SEARCH_CONCURRENT_REQUESTS=4
     depends_on:
       - ollama
       - searxng
@@ -84,6 +84,10 @@ Notes:
   WebUI receives HTML back from SearXNG and silently fails to parse it.
 - `RAG_WEB_SEARCH_CONCURRENT_REQUESTS` must **not** be `0` — that's a known
   silent-failure cause for this exact SearXNG + Open WebUI combo.
+- `RAG_WEB_SEARCH_RESULT_COUNT` kept low (4) deliberately — more snippets in
+  context increases the chance the model cross-wires which URL belongs to
+  which claim, producing fabricated citations (see "Watch for fabricated
+  citations specifically" in section 6 below).
 - No top-level `volumes:` section needed — everything is a bind mount under
   `./data`, visible next to this file.
 
@@ -166,6 +170,9 @@ Confirm `tools` appears under **Capabilities**. (It will likely also show
 collapsible, which is fine; if responses feel slow, append `/no_think` to a
 prompt to skip it, or `/think` to force it for a genuinely hard question.)
 
+Optional third model, `qwen3-coder:30b`, for questions needing deeper
+multi-hop reasoning than `qwen3:14b` reliably provides — see section 7.
+
 ---
 
 ## 4. sgpt → quick model
@@ -240,6 +247,10 @@ RULES, in order, every time:
 6. Be concise. Quote only the minimum needed to support each claim - do not reproduce large blocks of the source page.
 
 7. When the official docs are ambiguous or you find conflicting info between sources, say so explicitly rather than picking one silently.
+
+8. Only cite a URL if it appears verbatim in the search results returned to you this turn. Never construct, complete, or guess a URL from memory, even if you recognize the site's typical structure or have seen similar URLs during training. If you are not certain a URL is one you actually retrieved this turn, omit the citation and say the specific page could not be confirmed, rather than presenting an unverified URL as a source.
+
+9. When a question involves how two configuration behaviors interact (e.g. whether one setting overrides or adds to another), explicitly state which it is and name the correct option to achieve the user's actual goal, before giving your final answer. Do not stop at restating a single retrieved fact if the practical implication requires combining it with another.
 ```
 
 - **Advanced Params**:
@@ -307,3 +318,91 @@ the response:
    are documented silent-failure causes for this exact stack.
 3. Fall back to manually toggling web search per-message in the chat UI
    until the automatic tool-calling path is confirmed reliable.
+
+### Watch for fabricated citations specifically
+
+Even with rule 8 in the system prompt and web search working correctly, a
+model can still produce a URL that looks legitimate but was never actually
+in the search results — it's predicting a plausible path on a known domain
+rather than reproducing the real one, especially for well-known doc sites
+it saw heavily during training. Smaller/quantized local models do this more
+than large frontier models; it doesn't fully go away with prompting alone.
+
+**Don't trust the URL as written in the response text.** Check Open WebUI's
+citations panel (the source cards/footnotes under a response) instead —
+that's generated programmatically from the actual raw search results, not
+typed by the model, so it's ground truth. If the panel's URL differs from
+what the model wrote inline, that confirms a fabricated citation. Treat
+every `[DOCS]`/`[WEB]` URL as something to click and verify, not a
+guarantee, regardless of how well-tuned this setup is.
+
+---
+
+## 7. Optional: bigger model for tougher reasoning (qwen3-coder:30b)
+
+`qwen3:14b` is reliable but has limited capacity for multi-hop reasoning —
+e.g. questions that require combining two retrieved facts to reach a
+practical conclusion (see the Renovate `fileMatch`/`ignorePaths` case).
+`qwen3-coder:30b` is a mixture-of-experts model (30.5B total params, ~3.3B
+active per token) with more reasoning capacity, at the cost of speed and
+some tool-calling reliability. Add it as a **second** model alongside
+`qwen3:14b`, not a replacement — switch to it specifically for questions
+the smaller model handles shallowly.
+
+### Pull it
+
+```bash
+docker exec -it ollama ollama pull qwen3-coder:30b
+```
+
+Q4_K_M weights are ~19GB. With 12GB VRAM, Ollama automatically offloads the
+remainder to system RAM (you have 64GB, plenty of headroom) — expect
+noticeably slower generation than the fully-in-VRAM `qwen3:14b`, bottlenecked
+by PCIe bandwidth for the offloaded portion. Benchmark it once running; exact
+tokens/sec depends on your specific GPU.
+
+### Tune Ollama for the offload scenario
+
+Add to the `ollama` service's `environment:` in `docker-compose.yml`:
+
+```yaml
+    environment:
+      - OLLAMA_KV_CACHE_TYPE=q8_0     # shrinks KV cache memory, helps fit more on GPU
+      - OLLAMA_NUM_PARALLEL=1         # single-user setup - don't split VRAM across requests
+```
+
+Apply with `docker compose up -d`.
+
+### Verify tool-calling support
+
+```bash
+docker exec -it ollama ollama show qwen3-coder:30b
+```
+
+Confirm `tools` under Capabilities.
+
+**Known caveat**: this model's MoE routing occasionally fails to fire a
+tool call correctly even when tool-calling is supported — reported as more
+likely than on the larger 480B version, plausibly because the smaller
+expert pool sometimes routes to the wrong expert for a given prompt. If a
+query doesn't trigger search when it should, rephrasing it often resolves
+it. This is why it's a second model, not your default.
+
+### Add it as a second model in Open WebUI
+
+**Workspace → Models → `+`**
+
+- **Name**: `DevOps Assistant (docs-first, 30B)`
+- **Base Model**: `qwen3-coder:30b`
+- **System Prompt**: identical to the `qwen3:14b` model above (the full
+  prompt with rules 1–9, including the verbatim-URL rule and the
+  multi-hop synthesis rule).
+- **Advanced Params**: same as before — `temperature 0.15`, `top_p 0.9`,
+  `repeat_penalty 1.1`, `num_ctx 16384`, `Function Calling: Native`.
+- Same capability checkboxes as section 5 (Web Search, Citations, File
+  Upload/Context on; Terminal, Sub-agents, Automations, etc. off).
+
+Both models will now appear in the chat model dropdown — use `qwen3:14b`
+by default, and switch to the 30B model for questions that need deeper
+synthesis across multiple retrieved facts.
+
