@@ -37,13 +37,12 @@ services:
       - "11434:11434"
     volumes:
       - ./data/ollama:/root/.ollama
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+    gpus: all
+    environment:
+      - OLLAMA_FLASH_ATTENTION=1       # required for quantized KV cache below to take effect
+      - OLLAMA_KV_CACHE_TYPE=q8_0      # ~50% KV cache VRAM savings, minimal quality impact
+      - OLLAMA_KEEP_ALIVE=5m           # unload idle models after 5min to free VRAM
+      - OLLAMA_MAX_LOADED_MODELS=1     # only one model resident at a time (12GB card, multiple models)
     restart: unless-stopped
 
   searxng:
@@ -78,6 +77,43 @@ services:
       - searxng
     restart: unless-stopped
 ```
+
+`gpus: all` on the `ollama` service is the Compose 2.3+ shorthand for GPU
+passthrough. An earlier version of this file used the
+`deploy.resources.reservations.devices` syntax instead — that's officially
+correct per the Compose spec, but is known to be silently ignored outside
+Swarm mode on some Compose versions: it parses without error, but the
+container never actually gets the GPU, and Ollama falls back to full CPU
+inference with the GPU sitting idle (high CPU, growing system RAM, 0% GPU
+usage — if you saw exactly that, this was why). `gpus: all` avoids that
+ambiguity.
+
+Verify GPU passthrough is actually working before moving on:
+
+```bash
+docker compose up -d
+docker exec -it ollama nvidia-smi
+```
+
+This must show your GPU. If it doesn't, the issue is upstream of Compose —
+re-check the NVIDIA Container Toolkit setup from earlier (`docker run
+--rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi` should
+still succeed independently of Ollama). If `nvidia-smi` works but Ollama
+still runs on CPU, check `docker logs ollama` for GPU-detection errors.
+
+**Ongoing sanity check — expected generation speed on GPU vs CPU fallback:**
+Watch the `ollama` container logs during a chat response:
+```bash
+docker logs -f ollama
+```
+Look for a line like `slot print_timing: ... tg = 39.52 t/s`. For
+`qwen3:14b` (Q4_K_M, ~9GB) on a 12GB-class GPU, expect roughly **30–45
+tokens/sec** when correctly running on GPU — memory-bandwidth math on a
+card like the RTX 4070 puts a rough ceiling around 50–60 t/s, and real
+throughput typically lands at 60–70% of that once attention/KV-cache
+overhead is accounted for. If you ever see this drop to **single digits
+(roughly 3–10 t/s)**, that's the same silent-CPU-fallback symptom covered
+above — re-run the `nvidia-smi` check rather than assuming it's just slow.
 
 Notes:
 - `SEARXNG_QUERY_URL` **must** include `&format=json` — without it, Open
@@ -392,11 +428,11 @@ tokens/sec depends on your specific GPU.
 
 ### Tune Ollama for the offload scenario
 
-Add to the `ollama` service's `environment:` in `docker-compose.yml`:
+`OLLAMA_KV_CACHE_TYPE=q8_0` is already set globally in section 1 — no
+change needed there. Add one more env var specific to this offload
+scenario, to the `ollama` service's `environment:` in `docker-compose.yml`:
 
 ```yaml
-    environment:
-      - OLLAMA_KV_CACHE_TYPE=q8_0     # shrinks KV cache memory, helps fit more on GPU
       - OLLAMA_NUM_PARALLEL=1         # single-user setup - don't split VRAM across requests
 ```
 
@@ -542,4 +578,3 @@ You'll now have three models in the dropdown:
 - `qwen3:14b` (reasoning variant) — same weights as the default, but
   thinking-mode on with Qwen's recommended sampling, for questions that
   need facts connected rather than just retrieved.
-
