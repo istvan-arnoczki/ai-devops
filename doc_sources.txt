@@ -1,0 +1,26 @@
+# Official doc sources for your local knowledge base
+
+| Topic | Official site | Source pulled from |
+|---|---|---|
+| **Renovate** | https://docs.renovatebot.com/ | github.com/renovatebot/renovate (`docs/`, `website/docs`) |
+| **GitHub (Actions, REST, GraphQL, Auth)** | https://docs.github.com/ | github.com/github/docs (`content/...`) |
+| **GitHub CLI (`gh`)** | https://cli.github.com/manual/ | github.com/cli/cli (`docs/`) |
+| **Python** | https://docs.python.org/3/ | official downloadable text bundle (`docs.python.org/3/archives/`) |
+| **Bash** | https://www.gnu.org/software/bash/manual/ | official plain-text manual |
+| **Terraform core** | https://developer.hashicorp.com/terraform/docs | github.com/hashicorp/terraform (or `web-unified-docs`) |
+| **Terraform Google provider** | https://registry.terraform.io/providers/hashicorp/google/latest/docs | github.com/hashicorp/terraform-provider-google (`website/docs`) |
+| **Kubernetes** | https://kubernetes.io/docs/home/ | github.com/kubernetes/website (`content/en/docs`) |
+| **GCP** | https://cloud.google.com/docs | wget mirror of key sections (no public markdown repo) |
+| **Docker / Docker Compose** | https://docs.docker.com/ | github.com/docker/docs (`content/`) |
+| **Helm** | https://helm.sh/docs/ | github.com/helm/helm-www (`content/en/docs`) |
+| **kubectl reference** | https://kubernetes.io/docs/reference/kubectl/ | github.com/kubernetes/website (`content/en/docs/reference/kubectl`) |
+| **Ansible** | https://docs.ansible.com/ | github.com/ansible/ansible-documentation (`docs/docsite/rst`) |
+| **Terragrunt** | https://terragrunt.gruntwork.io/docs/ | github.com/gruntwork-io/terragrunt (`docs/`) |
+| **ArgoCD** | https://argo-cd.readthedocs.io/ | github.com/argoproj/argo-cd (`docs/`) |
+| **Prometheus** | https://prometheus.io/docs/ | github.com/prometheus/docs (`docs/`) |
+| **Grafana** | https://grafana.com/docs/ | github.com/grafana/grafana (`docs/sources/`) |
+| **pre-commit** | https://pre-commit.com/ | github.com/pre-commit/pre-commit.github.io |
+| **yq** | https://mikefarah.gitbook.io/yq/ | github.com/mikefarah/yq (`docs/`) |
+| **jq** | https://jqlang.org/ | github.com/jqlang/jq (`docs/`) |
+| **SOPS** | https://github.com/getsops/sops | github.com/getsops/sops (`README.md`, `docs/`) |
+| **Vault** | https://developer.hashicorp.com/vault/docs | github.com/hashicorp/vault (`website/content/docs`) |
