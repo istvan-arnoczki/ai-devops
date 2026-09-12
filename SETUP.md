@@ -19,7 +19,10 @@ your-project/
 └── data/
     ├── ollama/        (created automatically on first `up`)
     ├── open-webui/     (created automatically on first `up`)
-    └── searxng/        (created automatically on first `up`)
+    ├── searxng/        (created automatically on first `up`)
+    ├── llama-cpp/models/  (optional, section 9 - HF model cache)
+    └── llama-swap/        (optional, section 9 - create config.yaml
+                             here *before* first `up`, see section 9)
 ```
 
 ---
@@ -578,3 +581,339 @@ You'll now have three models in the dropdown:
 - `qwen3:14b` (reasoning variant) — same weights as the default, but
   thinking-mode on with Qwen's recommended sampling, for questions that
   need facts connected rather than just retrieved.
+
+---
+
+## 9. Optional: switch inference engine to llama.cpp + llama-swap (~15-30% faster)
+
+Ollama is a Go wrapper around llama.cpp — it embeds the same engine but
+adds an HTTP/process-management layer on top, which measurably costs
+throughput and VRAM headroom (commonly reported around 15-30% slower,
+~20% more VRAM used, versus running llama.cpp directly). This section
+swaps the `ollama` service for raw `llama.cpp` servers, managed by
+**llama-swap** — a small proxy that replicates Ollama's convenient
+"auto-load on request, auto-unload after idle, swap between models"
+behavior on top of llama.cpp, since llama.cpp's own server only ever
+holds one model at a time.
+
+**This is additive, not destructive.** Keep the `ollama` service defined
+in `docker-compose.yml` (just stop it, don't delete it) until you've
+confirmed llama-swap works end-to-end — GPU offload, tool-calling, and
+speed all need re-verifying on the new stack, and you want an easy
+fallback if something doesn't translate cleanly.
+
+**The real cost you're taking on**: unlike Ollama, llama.cpp does not
+automatically calculate how many model layers fit in your VRAM. You set
+`--n-gpu-layers` yourself, per model, and find the right number by trial
+and error (start high, back off if it OOMs). For your 14B/7B models this
+is a one-time five-minute exercise since they fit entirely in 12GB. For
+the 30B model doing partial CPU offload, it's a more deliberate tuning
+process — see the note in that model's config below.
+
+### Installing llama.cpp itself
+
+**Short answer: no separate install step for the Docker path below.** The
+`ghcr.io/mostlygeek/llama-swap:unified-cuda13` image already contains a
+CUDA-compiled `llama-server` binary — llama-swap's whole job is spawning
+and managing that binary per model. Once the container is up, confirm
+it's actually there and CUDA-enabled:
+
+```bash
+docker exec -it llama-swap llama-server --version
+docker exec -it llama-swap llama-server --help | grep -i cuda
+```
+
+If you only want the Docker-managed path, skip straight to "Add the
+llama-swap service" below — there's nothing else to install.
+
+**Optional: a native (non-Docker) build**, if you want direct access to
+llama.cpp's own CLI tools — `llama-bench` for precise, repeatable
+`--n-gpu-layers` tuning outside the request/response cycle,
+`llama-quantize` for producing your own GGUF quantizations, or
+`llama-cli` for quick one-off tests without going through llama-swap at
+all. This is a heavier prerequisite than anything else in this guide: it
+needs the actual CUDA *toolkit* (`nvcc` and headers) installed inside
+WSL, not just the driver on Windows that everything else here has relied
+on.
+
+```bash
+# CUDA toolkit inside WSL (separate from the Windows driver you already have)
+wget https://developer.download.nvidia.com/compute/cuda/repos/wsl-ubuntu/x86_64/cuda-keyring_1.1-1_all.deb
+sudo dpkg -i cuda-keyring_1.1-1_all.deb
+sudo apt-get update
+sudo apt-get install -y cuda-toolkit-13-0   # match the version to your driver's reported CUDA version
+
+# build tools
+sudo apt-get install -y git cmake build-essential
+
+git clone https://github.com/ggml-org/llama.cpp
+cd llama.cpp
+cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release -j$(nproc)
+
+# binaries land in build/bin/ - e.g. build/bin/llama-server, build/bin/llama-bench
+./build/bin/llama-server --version
+```
+
+Concrete use for the tuning problem mentioned above — sweep
+`--n-gpu-layers` methodically instead of guessing, using a downloaded
+GGUF file directly:
+```bash
+./build/bin/llama-bench -m /path/to/model.gguf -ngl 20,30,40,99
+```
+This runs a quick benchmark at each layer count in one command and
+reports tokens/sec for each — the highest layer count that doesn't OOM
+and still reports a sane number is your answer, and you carry that number
+back into `config.yaml`'s `--n-gpu-layers` for the equivalent model in
+the containerized setup.
+
+Verify the CUDA toolkit version in that `apt-get install` line matches
+what your driver actually reports (`nvidia-smi` in WSL) before running
+it — installing a mismatched toolkit version is a common source of build
+failures that look unrelated to CUDA at first glance.
+
+A native build is a separate binary from what's inside the Docker image —
+useful for ad-hoc testing and tuning (particularly `llama-bench` for
+finding the right `--n-gpu-layers` number methodically instead of manual
+trial and error), but it doesn't replace the containerized llama-swap
+setup below for actually serving Open WebUI and `sgpt`; keep both if you
+build this, rather than trying to wire the native binary into the
+container stack.
+
+### Add the llama-swap service
+
+Add this service to your existing `docker-compose.yml` (alongside, not
+replacing, the `ollama` service — stop `ollama` once you've validated
+this works):
+
+```yaml
+  llama-swap:
+    image: ghcr.io/mostlygeek/llama-swap:unified-cuda13
+    container_name: llama-swap
+    gpus: all
+    ports:
+      - "8090:8080"
+    volumes:
+      - ./data/llama-swap/config.yaml:/config/config.yaml
+      - ./data/llama-cpp/models:/root/.cache/huggingface
+    environment:
+      - LLAMA_SWAP_CONFIG=/config/config.yaml
+      - LLAMA_SWAP_LISTEN=0.0.0.0:8080
+      - LLAMA_SWAP_WATCH_CONFIG=true
+    restart: unless-stopped
+```
+
+Notes:
+- The `unified-cuda13` tag matches the CUDA 13.x runtime your `nvidia-smi`
+  output showed earlier. If your driver reports a CUDA 12.x runtime
+  instead, check `https://github.com/mostlygeek/llama-swap` for the
+  matching `unified-cuda12` (or equivalent) tag before pulling.
+- `gpus: all` — same fix as section 1, for the same reason. Confirm with
+  `docker exec -it llama-swap nvidia-smi` after `up`, exactly as before.
+- Model files download automatically from Hugging Face into
+  `./data/llama-cpp/models` on first use per model (see `-hf` flag below)
+  — no separate manual download step, but the first request to a new
+  model will be slow while it downloads.
+- Port `8090` is deliberately different from Ollama's `11434` so both can
+  run side by side during validation.
+
+**Create the config file on the host *before* running `docker compose up`
+for this service — this matters, not just a style preference.** Docker
+bind-mounts a source path that doesn't exist yet as a *directory*, not a
+file. If `./data/llama-swap/config.yaml` doesn't already exist as an
+actual file when the container first starts, you'll end up with a
+directory of that name instead, and nothing you write afterward will
+land in the place llama-swap actually reads from — the failure mode is
+usually "can't save the file" or the container silently reading an empty
+config. Always create the file first:
+
+```bash
+mkdir -p ./data/llama-swap
+touch ./data/llama-swap/config.yaml
+```
+
+### Create the config file
+
+`./data/llama-swap/config.yaml`:
+
+```yaml
+healthCheckTimeout: 180
+logLevel: info
+
+models:
+  "quick":
+    cmd: |
+      llama-server
+      -hf Qwen/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M
+      --port ${PORT}
+      --host 0.0.0.0
+      --ctx-size 8192
+      --n-gpu-layers 99
+      --flash-attn on
+      --cache-type-k q8_0
+      --cache-type-v q8_0
+    ttl: 300
+
+  "power":
+    cmd: |
+      llama-server
+      -hf Qwen/Qwen3-14B-GGUF:Q4_K_M
+      --port ${PORT}
+      --host 0.0.0.0
+      --ctx-size 16384
+      --n-gpu-layers 99
+      --flash-attn on
+      --cache-type-k q8_0
+      --cache-type-v q8_0
+      --jinja
+    ttl: 300
+
+  "power-reasoning":
+    cmd: |
+      llama-server
+      -hf Qwen/Qwen3-14B-GGUF:Q4_K_M
+      --port ${PORT}
+      --host 0.0.0.0
+      --ctx-size 16384
+      --n-gpu-layers 99
+      --flash-attn on
+      --cache-type-k q8_0
+      --cache-type-v q8_0
+      --jinja
+      --temp 0.6
+      --top-p 0.95
+      --top-k 20
+    ttl: 300
+
+  "power-30b":
+    cmd: |
+      llama-server
+      -hf Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M
+      --port ${PORT}
+      --host 0.0.0.0
+      --ctx-size 16384
+      --n-gpu-layers 20
+      --flash-attn on
+      --cache-type-k q8_0
+      --cache-type-v q8_0
+      --jinja
+    ttl: 300
+```
+
+Important caveats on this file, be honest with yourself about these
+before trusting it blindly:
+
+- **Verify the `-hf` repo/quant strings before relying on them.** These
+  are the most likely-correct Hugging Face repo names for these models
+  (official Qwen org GGUF releases), but I can't guarantee the exact
+  repo/tag naming hasn't shifted. Test each one standalone first:
+  ```bash
+  docker exec -it llama-swap llama-server -hf Qwen/Qwen3-14B-GGUF:Q4_K_M --port 9999
+  ```
+  If the repo/quant string is wrong, this fails loudly with a clear
+  download error — not a silent breakage — so it's safe to test. Adjust
+  the string to match what you find on `huggingface.co` if it doesn't
+  resolve (search the model name + "GGUF"; official Qwen org, or
+  well-known quantizers like `bartowski` or `unsloth`, are reliable
+  sources).
+- **`--jinja` is required** for proper chat-template/tool-call formatting
+  on these models — without it, tool calling for the web-search flow is
+  likely to break or degrade, mirroring the Qwen2.5-Coder tool-format
+  issues from earlier in this guide.
+- **`--flash-attn` needs an explicit value** (`on`/`off`/`auto`) on this
+  build — passing it as a bare boolean flag makes `llama-server` exit
+  immediately with an argument-parsing error, before it ever attempts to
+  load the model. If you ever see `process exited: code=1` in
+  `docker logs llama-swap` with almost no elapsed time (versus a slow
+  failure, which usually means a download/timeout issue instead), run
+  the exact command from the log manually to see `llama-server`'s actual
+  error text — flag syntax has shifted across llama.cpp versions before
+  and may again.
+- **`--n-gpu-layers 20` on `power-30b` is a starting guess, not a
+  verified number.** Unlike Ollama, llama.cpp won't automatically back
+  off if this doesn't fit — it'll error or OOM. Tune it:
+  1. Start it manually (`docker exec -it llama-swap llama-server -hf
+     Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M --port 9999
+     --n-gpu-layers 99`) and watch for an out-of-memory error.
+  2. If it OOMs, lower `--n-gpu-layers` in steps of ~5-10 and retry.
+  3. Once it loads without error, watch `nvidia-smi` during a real
+     generation to confirm VRAM usage sits comfortably under 12GB with
+     some headroom, then lock that number into `config.yaml`.
+- **Thinking mode** is still controlled the same way as Ollama — `/think`
+  / `/no_think` in the prompt or system message — there's no separate
+  llama.cpp CLI flag for it; the `--temp`/`--top-p`/`--top-k` flags on
+  `power-reasoning` just match Qwen's recommended sampling profile from
+  section 8.
+
+Apply:
+```bash
+docker compose up -d llama-swap
+```
+
+### Point Open WebUI at it
+
+llama-swap speaks the **OpenAI-compatible API**, not Ollama's native API
+— so this isn't a case of swapping `OLLAMA_BASE_URL` for a new host, it's
+a different connection type entirely in Open WebUI. Do this through the
+UI rather than env vars, for the same reason manual model creation beat
+JSON import earlier — it's the version-stable path:
+
+**Admin Settings → Connections → Add Connection → OpenAI API**
+- **Base URL**: `http://llama-swap:8080/v1`
+- **API Key**: any non-empty placeholder (e.g. `sk-local-no-auth`) —
+  llama-swap doesn't enforce one, but Open WebUI's OpenAI-connection form
+  typically requires a non-empty value.
+- Save, then confirm the `quick`, `power`, `power-reasoning`, and
+  `power-30b` model names appear as selectable models.
+
+Your existing custom models (`DevOps Assistant (docs-first)`, etc.) were
+built on Ollama base models — recreate them the same manual way as
+section 5, just pointing the **Base Model** field at the new OpenAI
+connection's `power` (or `power-reasoning`) model instead of `qwen3:14b`.
+
+### Point sgpt at it
+
+```bash
+cat > ~/.config/shell_gpt/.sgptrc << 'EOF'
+API_BASE_URL=http://localhost:8090/v1
+OPENAI_API_KEY=sk-local-no-auth
+DEFAULT_MODEL=quick
+CHAT_CACHE_LENGTH=100
+CHAT_CACHE_PATH=/tmp/shell_gpt/chat_cache
+CACHE_LENGTH=100
+CACHE_PATH=/tmp/shell_gpt/cache
+REQUEST_TIMEOUT=60
+DEFAULT_COLOR=magenta
+DISABLE_STREAMING=false
+PRETTIFY_MARKDOWN=true
+SHELL_INTERACTION=true
+OS_NAME=auto
+SHELL_NAME=auto
+EOF
+```
+
+### Verify it's actually faster (don't just assume the headline number)
+
+Re-run the exact same tokens/sec check from section 1, against the same
+model, so you're comparing like-for-like on your own hardware rather than
+trusting the general 15-30% figure:
+
+```bash
+docker logs -f llama-swap
+```
+
+Ask the same kind of question you benchmarked Ollama with earlier and
+compare the `t/s` figure directly against your earlier `39.52 t/s`
+baseline on `qwen3:14b`.
+
+### Once confirmed working
+
+```bash
+docker compose stop ollama
+```
+
+Keep the `ollama` service definition in the compose file for a while
+longer rather than deleting it outright — cheap insurance while you run
+the new stack for real, in case something (tool-calling reliability,
+a specific model's behavior) doesn't hold up the same way under
+llama.cpp as it did under Ollama.
