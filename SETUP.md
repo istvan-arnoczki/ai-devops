@@ -965,3 +965,38 @@ Run this against both your default model and the `power-reasoning`
 variant — a good answer states clearly whether it's additive or
 overriding, names the mechanism, and gives the practical implication, not
 just "here's what `permissions` does."
+
+## D.3 — CPU-only baseline test
+
+Useful for two things: getting an unambiguous "this is what silent GPU
+fallback looks like" reference number for your own hardware, and checking
+whether a model too big to fit in 12GB VRAM is at least usable purely in
+your 64GB system RAM.
+
+**Force CPU-only on llama-swap/llama.cpp** — explicit flag, no GPU-hiding
+needed:
+```bash
+docker exec -it llama-swap llama-server -hf Qwen/Qwen3-14B-GGUF:Q4_K_M --port 9999 --n-gpu-layers 0
+```
+
+**Force CPU-only on Ollama** — no equivalent single flag, so hide the GPU
+device from that one command instead (only affects this `exec` call, not
+the container's overall config):
+```bash
+docker exec -e CUDA_VISIBLE_DEVICES=-1 -it ollama ollama run qwen3:14b "test prompt"
+```
+
+Run the same D.1 benchmark prompt with `/no_think`, and check:
+```bash
+docker logs -f llama-swap    # or: docker logs -f ollama
+free -h                      # or: docker stats, for container-scoped RAM
+```
+
+Expect roughly **low single digits up to ~10 t/s** for a 14B model on
+CPU, depending on your processor — a 5-15x slowdown from GPU is typical,
+so this isn't meant to be usable for interactive chat, just a concrete
+reference point. Memory footprint (~9GB for this model's Q4_K_M weights)
+should sit comfortably inside 64GB, so RAM capacity isn't the constraint
+here — generation speed is. Compare this number directly against your GPU
+baseline from D.1 any time you're unsure whether offload actually
+happened.
