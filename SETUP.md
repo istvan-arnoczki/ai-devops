@@ -1,34 +1,18 @@
-# Local DevOps AI Setup
+# Local DevOps AI Setup (llama.cpp only)
 
-Docs-first, non-hallucinating DevOps assistant, running entirely locally in
-Docker. Answers are grounded in live web search of official documentation
-first (tagged `[DOCS]`, with URL + quote), falling back to general web
-search only when the docs don't cover it (tagged `[WEB]`). No offline/local
-doc store.
-
-**Two interchangeable serving engines, pick one:**
-
-- **Part 1 — llama-swap** (recommended): raw llama.cpp under the hood,
-  ~15-30% faster and lighter on VRAM than Ollama, at the cost of manual
-  `--n-gpu-layers` tuning per model instead of automatic fitting.
-- **Part 2 — Ollama**: simpler, automatic VRAM fitting, slightly slower.
-
-Both connect identically to **Open WebUI** (browser chat), **sgpt** (CLI),
-and **VS Code** (via the Continue extension) — each Part below is complete
-and standalone, so follow one straight through rather than jumping between
-them. Shared reference material (the system prompt, GPU/WSL troubleshooting,
-benchmarking) lives in the appendices at the end so it isn't duplicated
-four times.
+One local model — reasoning enabled, docs-first, internet-second, no
+offline doc store — served by **llama.cpp via llama-swap**, used from
+**Open WebUI** (browser), **sgpt** (CLI), and **VS Code** (Continue
+extension). Answers from Open WebUI are grounded in live web search
+(tagged `[DOCS]`/`[WEB]`, with URL + quote); `sgpt` uses the same model
+weights but an honestly-adapted prompt, since it can't execute tools —
+more on that in Part 1.7.
 
 ---
 
-# Part 0 — Shared prerequisites
-
-Do this once regardless of which engine you pick.
+# Part 0 — Prerequisites
 
 ## 0.1 Folder layout
-
-Everything lives next to `docker-compose.yml`:
 
 ```
 your-project/
@@ -36,10 +20,8 @@ your-project/
 └── data/
     ├── open-webui/        (created automatically on first `up`)
     ├── searxng/           (created automatically on first `up`)
-    ├── ollama/            (Part 2 only)
-    ├── llama-swap/        (Part 1 only — create config.yaml here
-    │                        BEFORE first `up`, see Part 1.4)
-    └── llama-cpp/models/  (Part 1 only — HF model cache)
+    ├── llama-swap/        (create config.yaml here BEFORE first `up`)
+    └── llama-cpp/models/  (HF model cache)
 ```
 
 ## 0.2 GPU passthrough
@@ -47,10 +29,8 @@ your-project/
 ### Install the NVIDIA driver and Container Toolkit
 
 **Install the NVIDIA driver on Windows itself, not inside WSL** — WSL2
-picks up the Windows-side driver automatically; installing a separate
-driver inside the WSL Ubuntu distro is unnecessary and can conflict.
-Grab the latest driver from `https://www.nvidia.com/drivers` (or use
-GeForce Experience / whatever came with your GPU) if you haven't already.
+picks up the Windows-side driver automatically. Grab the latest driver
+from `https://www.nvidia.com/drivers` if you haven't already.
 
 Inside your WSL2 Ubuntu shell, install the **NVIDIA Container Toolkit**,
 which is what lets Docker containers actually see the GPU:
@@ -77,19 +57,16 @@ installed toolkit.
 docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
 ```
 
-This must show your GPU. Both engines below use the `gpus: all` Compose
-shorthand (2.3+) in their service definitions — **not**
-`deploy.resources.reservations.devices`, which is officially valid per the
-Compose spec but is known to be silently ignored outside Swarm mode on some
-Compose versions: it parses without error, but the container never
-actually gets the GPU, and inference silently falls back to full CPU with
-the GPU sitting idle. If you ever see high CPU / growing system RAM / idle
-GPU despite `nvidia-smi` working standalone, see **Appendix B**.
+This must show your GPU. The compose file below uses the `gpus: all`
+Compose shorthand (2.3+) — **not** `deploy.resources.reservations.devices`,
+which is officially valid per the Compose spec but is known to be
+silently ignored outside Swarm mode on some Compose versions: it parses
+without error, but the container never actually gets the GPU, and
+inference silently falls back to full CPU with the GPU sitting idle. If
+you ever see high CPU / growing system RAM / idle GPU despite `nvidia-smi`
+working standalone, see **Appendix B**.
 
-## 0.3 SearXNG (shared by both paths — this is what powers the `[WEB]`/`[DOCS]` web search fallback)
-
-Add this service to `docker-compose.yml` (both Part 1 and Part 2 include it
-in their full files below — this is just the explanation):
+## 0.3 SearXNG (powers the `[WEB]`/`[DOCS]` web search fallback)
 
 ```yaml
   searxng:
@@ -107,16 +84,14 @@ in their full files below — this is just the explanation):
 ```
 
 **One-time config fix required** — SearXNG only enables HTML output by
-default; the JSON format Open WebUI needs must be added by hand, and the
-key doesn't exist in the generated file until you add it:
+default; the JSON format Open WebUI needs must be added by hand:
 
 ```bash
 docker compose up -d searxng   # let it generate the initial file first
 cat ./data/searxng/settings.yml
 ```
 
-Edit `./data/searxng/settings.yml` to add the missing `search:` block and
-`limiter: false`:
+Edit `./data/searxng/settings.yml`:
 
 ```yaml
 # Read the documentation before extending the defaults:
@@ -135,8 +110,7 @@ search:
     - json
 ```
 
-Generate a real secret key (don't leave a placeholder if this instance
-will ever be reachable beyond localhost):
+Generate a real secret key:
 ```bash
 openssl rand -hex 32
 ```
@@ -151,49 +125,37 @@ You should get a JSON body starting with `{"query": "test", ...}`, not
 
 ## 0.4 Two different model lists in Open WebUI — don't confuse them
 
-Once either engine is connected, you'll notice **the chat dropdown** (top
-of a chat window) lists every raw model the connection exposes — e.g.
-`quick`, `power`, `power-reasoning`, `power-30b`, or `qwen3:14b` directly —
-while **Workspace → Models** only lists custom models you've explicitly
-built there via the `+` flow. This is intentional, not a bug: Workspace →
-Models is a page for your saved presets (system prompt + params bundled
-together), not a catalog of every model a connection happens to expose.
+**The chat dropdown** (top of a chat window) lists the raw model
+(`assistant`) directly from the llama-swap connection. **Workspace →
+Models** only lists custom models you've explicitly built via the `+`
+flow — it's a page for saved presets (system prompt + params bundled
+together), not a catalog of every model a connection exposes.
 
-**This matters practically**: if you pick a raw base model straight from
-the chat dropdown (`power`, `qwen3:14b`, etc.) instead of one of your
-custom models (`DevOps Assistant (docs-first)`, etc.), you get **no
-system prompt at all** — no `[DOCS]`/`[WEB]` tagging, no priority-domain
-search behavior, none of Appendix A's rules. It'll still generate
-answers, just without any of the docs-first grounding this whole setup is
-for. Always select your custom model, not the raw base model, for actual
-use — the raw entries are only useful for the standalone testing/tuning
-commands elsewhere in this guide (pre-warming, benchmarking, etc.).
+**This matters practically**: if you pick the raw `assistant` model
+straight from the chat dropdown instead of your custom
+`DevOps Assistant (docs-first)` model, you get **no system prompt at
+all** — no `[DOCS]`/`[WEB]` tagging, no reasoning-first behavior, none of
+Appendix A's rules. It'll still generate answers, just without any of the
+grounding this setup is for. Always select your custom model for actual
+use.
 
 ---
 
-# Part 1 — llama-swap (recommended engine)
-
-llama-swap is a small proxy that replicates Ollama's "auto-load on
-request, auto-unload after idle, swap between models" convenience on top
-of raw llama.cpp, since llama.cpp's own server only ever holds one model
-at a time. It speaks the **OpenAI-compatible API**, not Ollama's native
-API — that matters for how Open WebUI and VS Code connect to it below.
+# Part 1 — llama.cpp + llama-swap
 
 ## 1.1 Installing llama.cpp itself
 
-**No separate install step needed for this path.** The
+**No separate install step needed.** The
 `ghcr.io/mostlygeek/llama-swap:unified-cuda13` image already contains a
 CUDA-compiled `llama-server` binary — llama-swap's whole job is spawning
-and managing that binary per model. Confirm it's there once the container
-is up:
+and managing that binary. Confirm it's there once the container is up:
 ```bash
 docker exec -it llama-swap llama-server --version
 ```
 
 **Optional native build**, only if you want direct access to llama.cpp's
-own CLI tools (`llama-bench` for precise `--n-gpu-layers` tuning outside
-the container, `llama-quantize`, `llama-cli`). This needs the actual CUDA
-*toolkit* (`nvcc`) inside WSL, not just the Windows driver:
+own CLI tools (`llama-bench`, `llama-quantize`, `llama-cli`). Needs the
+actual CUDA *toolkit* (`nvcc`) inside WSL, not just the Windows driver:
 ```bash
 wget https://developer.download.nvidia.com/compute/cuda/repos/wsl-ubuntu/x86_64/cuda-keyring_1.1-1_all.deb
 sudo dpkg -i cuda-keyring_1.1-1_all.deb
@@ -207,12 +169,8 @@ cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release -j$(nproc)
 ./build/bin/llama-server --version
 ```
-Useful for tuning `--n-gpu-layers` methodically:
-```bash
-./build/bin/llama-bench -m /path/to/model.gguf -ngl 20,30,40,99
-```
-This is a separate binary from the one inside Docker — handy for testing,
-doesn't replace the containerized setup below.
+A separate binary from the one inside Docker — handy for testing, doesn't
+replace the containerized setup below.
 
 ## 1.2 Full docker-compose.yml
 
@@ -266,26 +224,21 @@ services:
 ```
 
 Notes:
-- `gpus: all` — see Part 0.2. Confirm with
+- `gpus: all` — see 0.2. Confirm with
   `docker exec -it llama-swap nvidia-smi` after `up`.
-- The `unified-cuda13` tag matches a CUDA 13.x driver (check your own
-  `nvidia-smi` output — if it reports CUDA 12.x, use the matching
-  `unified-cuda12` tag from `https://github.com/mostlygeek/llama-swap`
-  instead).
+- The `unified-cuda13` tag matches a CUDA 13.x driver — check your own
+  `nvidia-smi` output; if it reports CUDA 12.x, use the matching
+  `unified-cuda12` tag from `https://github.com/mostlygeek/llama-swap`.
 - `RAG_WEB_SEARCH_RESULT_COUNT=4` (not higher) is deliberate — more
   snippets in context increases the chance the model cross-wires which
-  URL belongs to which claim, producing fabricated citations (Appendix A,
-  rule 8, plus Appendix B's citation note).
-- No `OLLAMA_BASE_URL` here — this path doesn't use Ollama at all. Open
-  WebUI connects to llama-swap as a generic OpenAI-compatible endpoint
-  (section 1.6).
+  URL belongs to which claim, producing fabricated citations.
 
-**Create the config file on the host *before* your first `up` for this
-service — this matters, not a style choice.** Docker bind-mounts a source
-path that doesn't exist yet as a *directory*, not a file. If
-`./data/llama-swap/config.yaml` isn't already a real file when the
-container first starts, you'll get a directory of that name instead, and
-nothing you write afterward lands where llama-swap actually reads from:
+**Create the config file on the host before your first `up` for this
+service** — Docker bind-mounts a source path that doesn't exist yet as a
+*directory*, not a file. If `./data/llama-swap/config.yaml` isn't already
+a real file when the container first starts, you'll get a directory of
+that name instead, and nothing you write afterward lands where llama-swap
+actually reads from:
 ```bash
 mkdir -p ./data/llama-swap ./data/llama-cpp/models
 touch ./data/llama-swap/config.yaml
@@ -298,7 +251,7 @@ docker compose up -d searxng llama-swap
 docker exec -it llama-swap nvidia-smi   # confirm GPU is visible
 ```
 
-## 1.4 config.yaml — model definitions
+## 1.4 config.yaml — the reasoning model, plus a fast one for sgpt
 
 `./data/llama-swap/config.yaml`:
 
@@ -307,34 +260,7 @@ healthCheckTimeout: 180
 logLevel: info
 
 models:
-  "quick":
-    cmd: |
-      llama-server
-      -hf Qwen/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M
-      --port ${PORT}
-      --host 0.0.0.0
-      --ctx-size 8192
-      --n-gpu-layers 99
-      --flash-attn on
-      --cache-type-k q8_0
-      --cache-type-v q8_0
-    ttl: 300
-
-  "power":
-    cmd: |
-      llama-server
-      -hf Qwen/Qwen3-14B-GGUF:Q4_K_M
-      --port ${PORT}
-      --host 0.0.0.0
-      --ctx-size 16384
-      --n-gpu-layers 99
-      --flash-attn on
-      --cache-type-k q8_0
-      --cache-type-v q8_0
-      --jinja
-    ttl: 300
-
-  "power-reasoning":
+  "assistant":
     cmd: |
       llama-server
       -hf Qwen/Qwen3-14B-GGUF:Q4_K_M
@@ -351,114 +277,108 @@ models:
       --top-k 20
     ttl: 300
 
-  "power-30b":
+  "quick":
     cmd: |
       llama-server
-      -hf Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M
+      -hf Qwen/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M
       --port ${PORT}
       --host 0.0.0.0
-      --ctx-size 16384
-      --n-gpu-layers 20
+      --ctx-size 8192
+      --n-gpu-layers 99
       --flash-attn on
       --cache-type-k q8_0
       --cache-type-v q8_0
-      --jinja
     ttl: 300
 ```
 
-Caveats, don't skip these:
-
-- **`-hf` repo/quant strings confirmed correct** — these are the official
-  Qwen GGUF repo names. Testing one standalone still doubles as
-  pre-warming the model cache (see 1.5):
-  ```bash
-  docker exec -it llama-swap llama-server -hf Qwen/Qwen3-14B-GGUF:Q4_K_M --port 9999
-  ```
-- **`--jinja` is required** for proper chat-template/tool-call formatting
-  — without it, tool calling for the web-search flow is likely to break
-  or degrade.
-- **`--flash-attn` needs an explicit value** (`on`/`off`/`auto`) on this
+Notes:
+- `Qwen3-14B` fits fully in 12GB VRAM (~9GB at Q4_K_M), has native/
+  reliable tool-calling support, and supports Qwen3's hybrid thinking
+  mode — the combination the Open WebUI setup depends on.
+- `--jinja` is required for correct chat-template/tool-call formatting —
+  without it, the web-search flow is likely to break or degrade.
+- `--flash-attn` needs an explicit value (`on`/`off`/`auto`) on this
   build — a bare `--flash-attn` flag makes `llama-server` exit
-  immediately with an argument-parsing error, before ever loading the
-  model. If `docker logs llama-swap` shows `process exited: code=1` with
-  almost no elapsed time (versus a slow failure, which usually means a
-  download/timeout issue), run the exact command from the log manually to
-  see the real error — flag syntax has shifted across llama.cpp versions
-  before and may again.
-- **`--n-gpu-layers 20` on `power-30b` is a starting guess, not verified.**
-  Unlike Ollama, llama.cpp doesn't automatically back off if this doesn't
-  fit — it errors or OOMs. Tune it:
-  1. Run manually with `--n-gpu-layers 99` and watch for an OOM error.
-  2. If it OOMs, lower in steps of ~5-10 and retry.
-  3. Once it loads cleanly, watch `nvidia-smi` during a real generation to
-     confirm VRAM sits comfortably under 12GB, then lock that number in.
-  4. Faster alternative: if you did the native build in 1.1, use
-     `llama-bench -m <file> -ngl 20,30,40,99` to sweep this in one command
-     instead of manual trial and error.
-- **Thinking mode** (`power-reasoning`) is controlled the same way as with
-  Qwen3 generally — `/think` / `/no_think` in the prompt or system message
-  — there's no separate llama.cpp CLI flag for it. The
-  `--temp`/`--top-p`/`--top-k` values match Qwen's own recommended
-  sampling profile for thinking mode (low temperature actively degrades
-  it — causes repetition or getting stuck).
+  immediately with an argument error before ever loading the model. If
+  `docker logs llama-swap` shows `process exited: code=1` with almost no
+  elapsed time, this is the first thing to check.
+- `--temp 0.6 --top-p 0.95 --top-k 20` on `assistant` is Qwen's own
+  recommended sampling profile **for thinking mode specifically** — low
+  temperature actively degrades thinking-mode output (causes repetition
+  or getting stuck), so this isn't a stylistic choice, it's required
+  given reasoning is always on for that model.
+- Thinking mode itself is controlled by `/think` in the system prompt
+  (Appendix A), not a CLI flag — there isn't one. `quick` has no `/think`
+  and no thinking-tuned sampling — it's the plain fast-lookup path, not a
+  second reasoning model.
+- `quick` is only wired into `sgpt`, not Open WebUI — Open WebUI still
+  has exactly one model (`assistant`), consistent with the rest of this
+  guide. This is purely a CLI-speed accommodation for when `/think`'s
+  latency is more than you want for a quick terminal lookup.
+- `--ctx-size 16384` on `assistant` — raise this if thinking traces get
+  truncated on complex questions (there's VRAM headroom, since `quick`
+  and `assistant` are never loaded simultaneously — see 1.5).
 
 Apply:
 ```bash
 docker compose up -d llama-swap
 ```
 
-## 1.5 Pre-warm every model before using it through the UI
+## 1.5 Pre-warm both models before using them
 
 **Models download lazily on first generation request, not at container
-startup or when you merely select one in a dropdown.** The first request
-to a new model simultaneously spawns the process, downloads several GB
-from Hugging Face, loads it into VRAM, then generates — which commonly
-exceeds Open WebUI's or llama-swap's own `healthCheckTimeout` and shows up
-as a generic error, not an obvious "still downloading" message. Pre-warm
-each model once (this is the same command as the verification step above):
+startup.** The first request simultaneously spawns the process,
+downloads the GGUF from Hugging Face, loads it into VRAM, then generates
+— which commonly exceeds Open WebUI's or llama-swap's own
+`healthCheckTimeout` and shows up as a generic error rather than an
+obvious "still downloading" message. Pre-warm both once:
 ```bash
-docker exec -it llama-swap llama-server -hf Qwen/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M --port 9999
 docker exec -it llama-swap llama-server -hf Qwen/Qwen3-14B-GGUF:Q4_K_M --port 9999
-docker exec -it llama-swap llama-server -hf Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M --port 9999
+docker exec -it llama-swap llama-server -hf Qwen/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M --port 9999
 ```
 Let each run until you see a "server listening" message, then `Ctrl+C`.
-The GGUF is now cached under `./data/llama-cpp/models` — subsequent loads
-(via CLI or through Open WebUI/sgpt/VS Code) read from local disk in
-seconds instead of re-downloading.
+The GGUF files are now cached under `./data/llama-cpp/models` —
+subsequent loads read from local disk in seconds, regardless of which
+model llama-swap is asked to swap to.
 
 ## 1.6 Connect Open WebUI
 
-llama-swap speaks OpenAI's API shape, not Ollama's — connect it as a
-generic OpenAI-compatible provider, done through the Admin UI (more
-version-stable than guessing at env var names):
+llama-swap speaks the OpenAI-compatible API, connect it as a generic
+provider through the Admin UI (more version-stable than guessing at env
+var names):
 
 **Admin Settings → Connections → Add Connection → OpenAI API**
 - **Base URL**: `http://llama-swap:8080/v1`
-- **API Key**: any non-empty placeholder, e.g. `sk-local-no-auth` —
-  llama-swap doesn't enforce one, but the connection form typically
-  requires a non-empty value.
-- Save, then confirm `quick`, `power`, `power-reasoning`, `power-30b`
-  appear as selectable models.
+- **API Key**: any non-empty placeholder, e.g. `sk-local-no-auth`.
+- Save, confirm `assistant` appears as a selectable model.
 
-**Create the docs-first custom model** — do this manually rather than via
-JSON import (Open WebUI's import schema isn't stable/documented enough to
-hand-craft reliably; manual creation always matches whatever your version
-actually expects):
+**Create the docs-first custom model manually** (not via JSON import —
+Open WebUI's import schema isn't stable/documented enough to hand-craft
+reliably; manual creation always matches whatever your version actually
+expects):
 
 **Workspace → Models → `+`**
 - **Name**: `DevOps Assistant (docs-first)`
-- **Base Model**: `power` (the connection you just added)
-- **System Prompt**: paste the full prompt from **Appendix A**.
-- **Advanced Params**: `temperature 0.15`, `top_p 0.9`,
-  `repeat_penalty 1.1`, `num_ctx 16384`, `Function Calling: Native`.
-- **Capabilities**: see the checklist in **Appendix A.1**.
-
-Repeat this for `power-reasoning` (Qwen's recommended sampling —
-`temperature 0.6`, `top_p 0.95`, `top_k 20` — instead of the above, plus
-starting the system prompt with `/think`) and `power-30b` if you want them
-as selectable custom models too, rather than raw base models.
+- **Base Model**: `assistant`
+- **System Prompt**: the full prompt from **Appendix A**.
+- **Advanced Params**: `temperature 0.6`, `top_p 0.95`, `top_k 20`,
+  `repeat_penalty 1`, `num_ctx 16384`, `Function Calling: Native`.
+- **Capabilities**: see the checklist in **Appendix A.1** — pay
+  particular attention to the Web Search note there, it appears in three
+  separate places in the UI and only one of them actually matters for
+  native tool-calling.
 
 ## 1.7 Connect sgpt
+
+**Important distinction before you set this up**: `sgpt` is a raw
+completion client — it has no mechanism to execute a tool call the way
+Open WebUI does. If you gave it the exact same system prompt (which
+claims "you have a web search tool"), the model may still attempt to
+emit a tool-call-formatted response, and since nothing on the `sgpt` side
+executes it, you'd likely see garbled tool-call JSON printed to your
+terminal instead of a real answer. So `sgpt` uses the **same model
+weights**, via a **separate, honestly-adapted role** that doesn't claim
+tool access it can't use.
 
 ```bash
 pip install shell-gpt --break-system-packages
@@ -466,7 +386,7 @@ mkdir -p ~/.config/shell_gpt
 cat > ~/.config/shell_gpt/.sgptrc << 'EOF'
 API_BASE_URL=http://localhost:8090/v1
 OPENAI_API_KEY=sk-local-no-auth
-DEFAULT_MODEL=quick
+DEFAULT_MODEL=assistant
 CHAT_CACHE_LENGTH=100
 CHAT_CACHE_PATH=/tmp/shell_gpt/chat_cache
 CACHE_LENGTH=100
@@ -480,278 +400,105 @@ OS_NAME=auto
 SHELL_NAME=auto
 EOF
 ```
-shell-gpt reads `API_BASE_URL` **from this config file**, not from
-`OPENAI_API_BASE`/similar environment variables — setting only env vars
-will silently fall through to OpenAI's real endpoint and fail with a 401.
-Test:
+`API_BASE_URL` must be in this file, not just an environment variable —
+shell-gpt doesn't read `OPENAI_API_BASE`-style env vars for this, and
+setting only env vars silently falls through to OpenAI's real endpoint
+and fails with a 401.
+
+Create the adapted role interactively (prefer the CLI flow over
+hand-writing the role file — same reasoning as avoiding the Open WebUI
+JSON import: an undocumented file schema is a worse bet than the
+official creation path):
 ```bash
-sgpt "explain this renovate.json error: <paste>"
+sgpt --create-role devops
 ```
-Note: `sgpt` is stateless and doesn't carry the system prompt or
-web-search behavior — it's a plain, fast Q&A path. Use Open WebUI for the
-docs-first/citation behavior.
+When prompted for the role's system prompt, paste **Appendix A.2**
+(the sgpt-adapted prompt — no false tool claims, but keeps the
+anti-fabrication discipline).
+
+Use it:
+```bash
+sgpt --role devops "explain this renovate.json error: <paste>"
+```
+Since there's no live search in this context, treat any specific
+option/flag name it states as something to verify yourself — the role's
+prompt asks it to flag uncertainty explicitly, but a local model's
+self-assessment of its own certainty is not fully reliable either.
+
+**For fast lookups where you don't want `/think`'s latency** — override
+the model per-call with `--model`, pointing at the lightweight `quick`
+entry from `config.yaml` instead of the default `assistant`:
+```bash
+sgpt --model quick "quick syntax check: does this bash line look right? <paste>"
+```
+This uses `quick` directly with no role/system prompt at all (plain raw
+completion) — appropriate for fast, low-stakes syntax questions, not for
+anything where the anti-fabrication discipline in Appendix A.2 actually
+matters. If you want `quick` with the same fabrication-discipline prompt
+instead of no prompt, create a second role once:
+```bash
+sgpt --create-role devops-quick
+```
+paste Appendix A.2 but remove the `/think` line (there's no reasoning
+mode to enable on this model), then use:
+```bash
+sgpt --model quick --role devops-quick "..."
+```
+`DEFAULT_MODEL=assistant` in `.sgptrc` stays as your default for anything
+you'd type without a flag — `--model quick` is an explicit, deliberate
+opt-out for a single call, not a config-wide switch.
+self-assessment of its own certainty is not fully reliable either.
 
 ## 1.8 Connect VS Code (Continue extension)
 
-Install the **Continue** extension from the VS Code marketplace. Open its
-config (Continue side panel → gear icon → Configure, or edit
-`~/.continue/config.yaml` directly):
+Install the **Continue** extension, edit `~/.continue/config.yaml`:
 
 ```yaml
 name: Local DevOps Config
 version: 0.0.1
 schema: v1
 models:
-  - name: Local Quick (llama-swap)
+  - name: Local Assistant (llama-swap)
     provider: openai
-    model: quick
-    apiBase: http://localhost:8090/v1
-    apiKey: sk-local-no-auth
-    roles:
-      - chat
-      - edit
-      - autocomplete
-
-  - name: Local Power (llama-swap)
-    provider: openai
-    model: power
+    model: assistant
     apiBase: http://localhost:8090/v1
     apiKey: sk-local-no-auth
     roles:
       - chat
       - edit
 ```
-Reload the window (command palette → *Developer: Reload Window*), open
-the Continue panel, and pick one of these models. `quick` is a sensible
-choice for the `autocomplete` role specifically — it's the smaller/faster
-model and autocomplete needs low latency more than reasoning depth.
-Note VS Code/Continue talks directly to llama-swap, bypassing Open
-WebUI's citation/web-search behavior entirely — it's a coding assistant
-here, not the docs-first researcher.
+
+**Deliberately no `autocomplete` role here.** Thinking mode adds a hidden
+reasoning trace before every response, including trivial ones — fine for
+a chat question, actively bad for inline autocomplete, which needs to
+feel instant. If you want autocomplete too, it would need a second,
+non-thinking model entry, which is outside the "one model" scope of this
+setup — flagging the trade-off rather than silently degrading
+autocomplete UX or silently expanding scope back to multiple models.
 
 ## 1.9 Verify end-to-end
 
 1. In Open WebUI, ask an obscure, version-specific question through the
    `DevOps Assistant (docs-first)` model. Confirm a `[DOCS]` or `[WEB]`
    tag with a real URL appears — not a bare confident answer.
-2. Check the tokens/sec sanity range and compare against Ollama if you've
-   run both — see **Appendix D**.
+2. Confirm thinking mode is actually engaging (a collapsible reasoning
+   block before the answer). If it isn't, re-check that `/think` is
+   genuinely the first line of the system prompt.
 3. If tool-calling doesn't fire reliably, re-check the SearXNG query URL
-   (`&format=json`) and confirm `--jinja` is present in the relevant
-   model's `cmd:` block.
+   (`&format=json`), confirm `--jinja` is present in `config.yaml`, and
+   re-check the three-Web-Search-toggles note in Appendix A.1.
+4. Test `sgpt --role devops` with the same kind of question and confirm
+   it does **not** print raw tool-call-looking JSON — if it does, the
+   adapted role prompt didn't take, re-check `sgpt --list-roles`.
 
 ---
 
-# Part 2 — Ollama (simpler alternative)
-
-Ollama wraps llama.cpp with automatic VRAM fitting, a model registry
-(`ollama pull <tag>`), and its own native API — trading some throughput
-for a lot of convenience.
-
-## 2.1 Full docker-compose.yml
-
-```yaml
-services:
-  searxng:
-    image: searxng/searxng:latest
-    container_name: searxng
-    ports:
-      - "8888:8080"
-    volumes:
-      - ./data/searxng:/etc/searxng
-    environment:
-      - SEARXNG_BASE_URL=http://localhost:8888/
-      - UWSGI_WORKERS=2
-      - UWSGI_THREADS=2
-    restart: unless-stopped
-
-  ollama:
-    image: ollama/ollama
-    container_name: ollama
-    ports:
-      - "11434:11434"
-    volumes:
-      - ./data/ollama:/root/.ollama
-    gpus: all
-    environment:
-      - OLLAMA_FLASH_ATTENTION=1       # required for quantized KV cache below to take effect
-      - OLLAMA_KV_CACHE_TYPE=q8_0      # ~50% KV cache VRAM savings, minimal quality impact
-      - OLLAMA_KEEP_ALIVE=5m           # unload idle models after 5min to free VRAM
-      - OLLAMA_MAX_LOADED_MODELS=1     # only one model resident at a time (12GB card, multiple models)
-    restart: unless-stopped
-
-  open-webui:
-    image: ghcr.io/open-webui/open-webui:main
-    container_name: open-webui
-    ports:
-      - "3000:8080"
-    volumes:
-      - ./data/open-webui:/app/backend/data
-    environment:
-      - OLLAMA_BASE_URL=http://ollama:11434
-      - ENABLE_RAG_WEB_SEARCH=true
-      - RAG_WEB_SEARCH_ENGINE=searxng
-      - SEARXNG_QUERY_URL=http://searxng:8080/search?q=<query>&format=json
-      - RAG_WEB_SEARCH_RESULT_COUNT=4
-      - RAG_WEB_SEARCH_CONCURRENT_REQUESTS=4
-    depends_on:
-      - ollama
-      - searxng
-    restart: unless-stopped
-```
-
-`gpus: all` — see Part 0.2. Confirm with
-`docker exec -it ollama nvidia-smi` after `up`.
-
-```bash
-docker compose up -d
-```
-
-## 2.2 Pull the models
-
-```bash
-docker exec -it ollama ollama pull qwen2.5-coder:7b     # quick
-docker exec -it ollama ollama pull qwen3:14b            # power / power-reasoning (same weights)
-docker exec -it ollama ollama pull qwen3-coder:30b      # power-30b (optional, MoE, partial CPU offload)
-```
-
-Qwen3 is used for the tool-calling-critical models specifically because it
-has native/reliable tool-calling support in Ollama — Qwen2.5-Coder does
-not, and tends to dump tool calls as plain-text JSON instead of actually
-invoking them.
-
-Verify before trusting the workflow:
-```bash
-docker exec -it ollama ollama show qwen3:14b
-```
-Confirm `tools` appears under **Capabilities** (it will likely also show
-`thinking` — Qwen3's reasoning mode, used by the `power-reasoning` variant
-below). `qwen3-coder:30b` has no `thinking` capability — it's
-instruct-only.
-
-**Get the actual `--n-gpu-layers` number Ollama computed**, useful
-reference even on this path (and directly reusable if you ever switch to
-Part 1):
-```bash
-docker logs ollama 2>&1 | grep -i "offload"
-```
-Look for a line like `llm_load_tensors: offloaded 41/41 layers to GPU`.
-
-## 2.3 Connect Open WebUI
-
-Ollama's native connection is usually pre-wired via `OLLAMA_BASE_URL` in
-the compose file above — confirm under **Admin Settings → Connections**
-that it shows connected.
-
-**Create the docs-first custom model manually** (not via JSON import — see
-Part 1.6 for why):
-
-**Workspace → Models → `+`**
-- **Name**: `DevOps Assistant (docs-first)`
-- **Base Model**: `qwen3:14b`
-- **System Prompt**: paste the full prompt from **Appendix A**.
-- **Advanced Params**: `temperature 0.15`, `top_p 0.9`,
-  `repeat_penalty 1.1`, `num_ctx 16384`, `Function Calling: Native`.
-- **Capabilities**: see the checklist in **Appendix A.1**.
-
-**Second model — reasoning variant** (same weights, thinking mode
-forced on, for questions needing multi-fact synthesis — e.g. "does
-setting A override or add to setting B"):
-
-**Workspace → Models → `+`**
-- **Name**: `DevOps Assistant (docs-first, 14B-reasoning)`
-- **Base Model**: `qwen3:14b`
-- **System Prompt**: Appendix A's prompt, but starting with `/think` on
-  its own first line, plus rule 13 from Appendix A.2.
-- **Advanced Params**: `temperature 0.6`, `top_p 0.95`, `top_k 20`,
-  `repeat_penalty 1`, `num_ctx 16384` (or higher — thinking traces are
-  verbose), `Function Calling: Native`.
-
-**Third model — bigger coder** (optional, heavier reasoning capacity,
-slower due to CPU offload, some tool-calling flakiness on MoE routing —
-use selectively, not as default):
-
-**Workspace → Models → `+`**
-- **Name**: `DevOps Assistant (docs-first, 30B)`
-- **Base Model**: `qwen3-coder:30b`
-- **System Prompt / Params**: same as the first model above.
-
-## 2.4 Connect sgpt
-
-```bash
-pip install shell-gpt --break-system-packages
-mkdir -p ~/.config/shell_gpt
-cat > ~/.config/shell_gpt/.sgptrc << 'EOF'
-API_BASE_URL=http://localhost:11434/v1
-OPENAI_API_KEY=ollama
-DEFAULT_MODEL=qwen2.5-coder:7b
-CHAT_CACHE_LENGTH=100
-CHAT_CACHE_PATH=/tmp/shell_gpt/chat_cache
-CACHE_LENGTH=100
-CACHE_PATH=/tmp/shell_gpt/cache
-REQUEST_TIMEOUT=60
-DEFAULT_COLOR=magenta
-DISABLE_STREAMING=false
-PRETTIFY_MARKDOWN=true
-SHELL_INTERACTION=true
-OS_NAME=auto
-SHELL_NAME=auto
-EOF
-```
-Same gotcha as Part 1.7 applies — `API_BASE_URL` must be in this file, not
-just an environment variable, or sgpt silently falls through to OpenAI's
-real endpoint and fails with a 401.
-```bash
-sgpt "explain this renovate.json error: <paste>"
-```
-
-## 2.5 Connect VS Code (Continue extension)
-
-```yaml
-name: Local DevOps Config
-version: 0.0.1
-schema: v1
-models:
-  - name: Local Quick (Ollama)
-    provider: openai
-    model: qwen2.5-coder:7b
-    apiBase: http://localhost:11434/v1
-    apiKey: ollama
-    roles:
-      - chat
-      - edit
-      - autocomplete
-
-  - name: Local Power (Ollama)
-    provider: openai
-    model: qwen3:14b
-    apiBase: http://localhost:11434/v1
-    apiKey: ollama
-    roles:
-      - chat
-      - edit
-```
-Ollama also exposes a native `ollama` provider type in Continue, but it
-doesn't support the auth field consistently — using the `openai` provider
-type against Ollama's OpenAI-compatible `/v1` endpoint (as above) is more
-consistent and is the same pattern used in Part 1, so your config looks
-almost identical regardless of which engine you're on.
-
-## 2.6 Verify end-to-end
-
-1. Ask an obscure question through `DevOps Assistant (docs-first)` and
-   confirm a `[DOCS]`/`[WEB]` tag with a real URL — not a bare answer.
-2. Check tokens/sec — see **Appendix D** for the expected range and how
-   to spot silent CPU fallback.
-3. Test the Renovate-style multi-hop question (Appendix D) against the
-   reasoning variant if the default model stops short of a full answer.
-
----
-
-# Appendix A — System prompt (used by both paths)
+# Appendix A — System prompt (Open WebUI, full tool access)
 
 ```
-You are a DevOps assistant. You have a web search tool. You do NOT have a local/offline document store - all documentation lookups happen live via web search.
+/think
+
+You are a DevOps assistant with reasoning enabled. You have a web search tool. You do NOT have a local/offline document store - all documentation lookups happen live via web search.
 
 PRIORITY OFFICIAL DOMAINS (search these first / prefer results from these):
 - docs.renovatebot.com
@@ -789,21 +536,25 @@ RULES, in order, every time:
 
 8. Only cite a URL if it appears verbatim in the search results returned to you this turn. Never construct, complete, or guess a URL from memory, even if you recognize the site's typical structure or have seen similar URLs during training. If you are not certain a URL is one you actually retrieved this turn, omit the citation and say the specific page could not be confirmed, rather than presenting an unverified URL as a source.
 
-9. When a question involves how two configuration behaviors interact (e.g. whether one setting overrides or adds to another), explicitly state which it is and name the correct option to achieve the user's actual goal, before giving your final answer. Do not stop at restating a single retrieved fact if the practical implication requires combining it with another.
+9. Apply the same verbatim standard from rule 8 to configuration option names, command flags, and API field names, not just URLs. Before stating that a specific option/flag/field exists, confirm you can point to it appearing, spelled exactly that way, in the search results returned to you this turn. A plausible-sounding name that fits the tool's naming pattern is not the same as a confirmed one - if you cannot find the exact name in what you retrieved, say so explicitly ("I could not confirm an option with this name") rather than stating one that seems likely.
 
-10. Apply the same verbatim standard from rule 8 to configuration option names, command flags, and API field names, not just URLs. Before stating that a specific option/flag/field exists, confirm you can point to it appearing, spelled exactly that way, in the search results returned to you this turn. A plausible-sounding name that fits the tool's naming pattern is not the same as a confirmed one - if you cannot find the exact name in what you retrieved, say so explicitly ("I could not confirm an option with this name") rather than stating one that seems likely.
+10. Confirming an option/flag/field name is spelled correctly (rule 9) is not the same as confirming it is the right answer to the question asked. A real option that exists for a different feature or section of the docs is not a valid answer just because the string matches - confirm the documented purpose of the option actually matches what is being asked, not just that the name is real.
 
-11. Confirming an option/flag/field name is spelled correctly (rule 10) is not the same as confirming it is the right answer to the question asked. A real option that exists for a different feature or section of the docs is not a valid answer just because the string matches - confirm the documented purpose of the option actually matches what is being asked, not just that the name is real.
+11. If the user tells you a previous answer was incorrect, do not simply apologize and offer a new guess. Perform a fresh search, using different search terms than your first attempt, before answering again. If you still cannot confirm a correct answer after the second attempt, say so plainly rather than presenting another unconfirmed guess as if correction alone made it more reliable.
 
-12. If the user tells you a previous answer was incorrect, do not simply apologize and offer a new guess. Perform a fresh search, using different search terms than your first attempt, before answering again. If you still cannot confirm a correct answer after the second attempt, say so plainly rather than presenting another unconfirmed guess as if correction alone made it more reliable.
+12. When a question involves how two configuration behaviors interact (e.g. whether one setting overrides or adds to another), explicitly state which it is and name the correct option to achieve the user's actual goal, before giving your final answer. Do not stop at restating a single retrieved fact if the practical implication requires combining it with another.
+
+13. Before giving your final answer to a question that requires connecting more than one fact, explicitly write out: (a) each relevant fact you found, with its source, (b) how those facts interact or constrain each other, (c) the practical conclusion or recommendation that follows. Only then give the final answer.
+
+14. You do not have access to scheduling, automation, or recurring-task tools, and must never attempt to call one. If a question seems to ask for monitoring, scheduling, or recurring checks, explain that this is out of scope for you rather than attempting a tool call.
 ```
 
-## A.1 — Capabilities checklist (Open WebUI, both paths)
+## A.1 — Capabilities checklist (Open WebUI)
 
 Your Open WebUI version likely exposes a broad "agent OS" capability set
-(Terminal, sub-agents, automations, channels, etc.) beyond what a docs-first
-assistant needs. More enabled tools means more chances the model picks the
-wrong one — trim aggressively:
+(Terminal, sub-agents, automations, channels, etc.) beyond what a
+docs-first assistant needs. More enabled tools means more chances the
+model picks the wrong one — trim aggressively:
 
 **Web Search specifically appears in three separate places, and they are
 not the same toggle:**
@@ -814,11 +565,11 @@ not the same toggle:**
 - **Builtin Tools → Web Search** — registers `web_search` as an actual
   **callable function** for native tool-calling.
 
-With `Function Calling: Native` set (as this whole guide uses), the model
-needs a real callable tool — that only comes from **Builtin Tools**. If
-only the first two are checked, native mode has nothing to call, and the
-model will accurately say it can't access the internet rather than
-hallucinating — check **all three**, not just the top two.
+With `Function Calling: Native` set, the model needs a real callable
+tool — that only comes from **Builtin Tools**. If only the first two are
+checked, native mode has nothing to call, and the model will accurately
+say it can't access the internet rather than hallucinating — check **all
+three**, not just the top two.
 
 **Check:** Web Search (all three locations above), Citations, File
 Upload, File Context, Status Updates, Chat History, Time & Calculation,
@@ -831,16 +582,28 @@ Image Generation, Memory (keep lookups stateless/deterministic), Knowledge
 Base (no local doc store — this would pull from stored docs instead of
 live search), Vision (unless your base model actually supports it).
 
-## A.2 — Reasoning-variant addendum (rule 13, and `/think`)
+## A.2 — Adapted system prompt (sgpt, no tool access)
 
-For the `power-reasoning` model in either path, start the system prompt
-with `/think` on its own line before the rest of Appendix A's prompt
-(documented Qwen3 behavior: it honors `/think`/`/no_think` in either the
-system message or user turns, following the most recent instruction), and
-append this as rule 13:
+Use this for the `sgpt --create-role devops` prompt (Part 1.7). Same
+weights, same reasoning mode, but honest about not having live search —
+claiming a tool the client can't execute risks the model emitting
+tool-call-formatted text that just prints as garbled output in a
+terminal.
 
 ```
-13. Before giving your final answer to a question that requires connecting more than one fact, explicitly write out: (a) each relevant fact you found, with its source, (b) how those facts interact or constrain each other, (c) the practical conclusion or recommendation that follows. Only then give the final answer.
+/think
+
+You are a DevOps assistant. You do NOT have live internet or documentation search access in this session - answer using training knowledge only.
+
+Because you cannot verify current documentation here, apply extra caution:
+
+1. Before stating the name of a specific configuration option, command flag, or API field, consider whether you are genuinely confident it is real versus inferring a plausible-sounding name that fits the tool's naming pattern. If you are not highly confident, say so explicitly rather than stating it as fact.
+
+2. Do not fabricate citations, URLs, or quoted documentation snippets - you have no way to verify them in this session, so never include them.
+
+3. For anything version-specific, recently-changed, or exact-syntax-critical, explicitly recommend the user verify against current official documentation before relying on your answer, rather than presenting it as confirmed.
+
+4. Be concise.
 ```
 
 ---
@@ -849,7 +612,7 @@ append this as rule 13:
 
 ## B.1 — Silent CPU fallback (GPU idle, high CPU/RAM)
 
-Symptom: `nvidia-smi` works standalone, but a model runs on CPU anyway.
+Symptom: `nvidia-smi` works standalone, but the model runs on CPU anyway.
 Usually a **WSL2 GPU-passthrough race condition at boot** — WSL's GPU
 paravirtualization layer (`/dev/dxg`) can still be settling when the
 container starts and probes for CUDA, the probe fails, and it silently
@@ -857,7 +620,7 @@ falls back to CPU for that container's whole life.
 
 Fast fix:
 ```bash
-docker compose restart ollama    # or llama-swap
+docker compose restart llama-swap
 ```
 
 Durable fix — wait for the GPU before starting the stack:
@@ -910,12 +673,12 @@ stack.
 
 ```bash
 ip addr show eth0                          # WSL's own network - must show a real 172.x IP
-docker exec -it ollama curl http://localhost:11434/api/tags   # (or llama-swap equivalent)
-docker exec -it open-webui curl http://ollama:11434/api/tags  # container-to-container
+docker exec -it llama-swap curl http://localhost:8080/v1/models
+docker exec -it open-webui curl http://llama-swap:8080/v1/models   # container-to-container
 docker compose ps                          # all should show "Up", not "Restarting"/"Exited"
 ```
-If Open WebUI shows configured models but they're not selectable, this is
-almost always a stale connection to the engine, not a missing model — try
+If Open WebUI shows the configured model but it's not selectable, this is
+almost always a stale connection to llama-swap, not a missing model — try
 `docker compose restart open-webui` and a hard browser refresh before
 assuming something is actually broken.
 
@@ -931,113 +694,53 @@ prompting alone (rule 8 in Appendix A helps, doesn't eliminate it).
 citations panel (source cards/footnotes under a response) instead; that's
 generated from the actual raw search results, not typed by the model.
 
----
+## B.5 — llama.cpp doesn't show tokens/sec in logs
 
-# Appendix C — Switching engines / disabling one cleanly
-
-You can run both `ollama` and `llama-swap` containers simultaneously with
-no port/path conflicts — the only real constraint is **VRAM**, since
-both can't hold a model resident at once on a 12GB card. Both have
-5-minute idle-unload configured (`OLLAMA_KEEP_ALIVE`, `ttl: 300`), so
-sequential testing never collides; to force an immediate switch instead
-of waiting out the TTL:
+Possibly a known regression in recent `llama-server` builds (GitHub issue
+#15865) where console/web timing display broke starting around build
+`b6399`. More reliable workaround — request timing directly in the API
+response instead of relying on log/console output:
 ```bash
-docker exec -it ollama ollama stop qwen3:14b
+curl http://localhost:8090/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "assistant",
+    "messages": [{"role":"user","content":"test"}],
+    "timings_per_token": true
+  }'
 ```
-
-**To fully disable one** (e.g. after confirming llama-swap works and you
-want to drop Ollama): don't just comment out the service block — Compose
-won't stop an already-running container it no longer sees, and
-`open-webui`'s `depends_on` will error if it references a removed service.
-
+Or poll the live `/slots` endpoint during generation (needs `--slots`
+added to the model's `cmd:` in `config.yaml`):
 ```bash
-docker compose stop ollama
+watch -n 0.5 'curl -s http://localhost:8090/slots | jq'
 ```
-Then edit `docker-compose.yml`: remove the `ollama:` block, remove the
-`- ollama` line from `open-webui`'s `depends_on:`, and remove the
-`OLLAMA_BASE_URL` env var (harmless to leave, but shows a permanently
-broken connection in Admin Settings otherwise). Apply with:
-```bash
-docker compose up -d --remove-orphans
-```
-`--remove-orphans` is what actually removes the now-unreferenced
-container — a plain `up` leaves it running in the background.
-`./data/ollama` (pulled models) is safe to leave on disk as a quick-revert
-option, or delete later to reclaim space.
 
 ---
 
-# Appendix D — Benchmarking
+# Appendix C — Trust tiers: what to verify before acting
 
-## D.1 — Speed check
+A 14B local model, even with 14 layered rules and full tool access, can
+still fabricate both an answer and a citation for it on a moderately
+specific task (config syntax, exact option names) — this is a capacity
+ceiling, not a prompt-wording problem, and no amount of additional
+prompting fully closes it. Calibrate trust by task type rather than
+treating every answer the same:
 
-Watch the engine's logs during a chat response:
-```bash
-docker logs -f ollama       # or: docker logs -f llama-swap
-```
-Look for a timing line (Ollama: `slot print_timing: ... tg = 39.52 t/s`;
-llama-swap logs the same underlying llama.cpp timing). For `qwen3:14b`
-(Q4_K_M, ~9GB) on a 12GB-class GPU, expect roughly **30–45 tokens/sec** on
-GPU — memory-bandwidth math on a card like the RTX 4070 puts a rough
-ceiling around 50–60 t/s, with real throughput landing at 60–70% of that
-once attention/KV-cache overhead is accounted for. **Single digits
-(roughly 3–10 t/s)** means silent CPU fallback — see Appendix B.1, not a
-"just slow" situation.
+- **Trust with light spot-checking**: general explanations, architecture
+  questions, "how does X work," conceptual comparisons.
+- **Verify the specific claim before acting on it**: any stated
+  option/flag/field name — click through the citation, don't just trust
+  the `[DOCS]` tag.
+- **Never trust as final — always validate externally**: any generated
+  code/config artifact you're actually going to deploy. For Renovate
+  specifically, run `npx renovate-config-validator` against anything
+  generated before it goes near a real repo — a good habit independent of
+  AI use entirely, and the same principle applies to Terraform (`terraform
+  validate`), Kubernetes manifests (`kubectl apply --dry-run=client`), and
+  so on.
 
-Use this same prompt on both engines for a fair comparison (avoids tool
-calling, which would swamp the signal with search latency):
-> "Write a Python function that implements a binary search on a sorted
-> list, with a docstring and type hints. Then explain how its time
-> complexity is derived, in about 300 words."
-
-Force `/no_think` for this test, run it 3 times, discard the first (cold
-load skews it), average the rest.
-
-## D.2 — Reasoning-quality check
-
-Tests whether a model actually connects two facts into a conclusion,
-rather than stopping at the first true statement:
-> "In GitHub Actions, if a workflow has both a top-level `permissions`
-> block and a job-level `permissions` block, which one takes effect for
-> that job — does the job-level block add to the top-level one, or
-> replace it entirely?"
-
-Run this against both your default model and the `power-reasoning`
-variant — a good answer states clearly whether it's additive or
-overriding, names the mechanism, and gives the practical implication, not
-just "here's what `permissions` does."
-
-## D.3 — CPU-only baseline test
-
-Useful for two things: getting an unambiguous "this is what silent GPU
-fallback looks like" reference number for your own hardware, and checking
-whether a model too big to fit in 12GB VRAM is at least usable purely in
-your 64GB system RAM.
-
-**Force CPU-only on llama-swap/llama.cpp** — explicit flag, no GPU-hiding
-needed:
-```bash
-docker exec -it llama-swap llama-server -hf Qwen/Qwen3-14B-GGUF:Q4_K_M --port 9999 --n-gpu-layers 0
-```
-
-**Force CPU-only on Ollama** — no equivalent single flag, so hide the GPU
-device from that one command instead (only affects this `exec` call, not
-the container's overall config):
-```bash
-docker exec -e CUDA_VISIBLE_DEVICES=-1 -it ollama ollama run qwen3:14b "test prompt"
-```
-
-Run the same D.1 benchmark prompt with `/no_think`, and check:
-```bash
-docker logs -f llama-swap    # or: docker logs -f ollama
-free -h                      # or: docker stats, for container-scoped RAM
-```
-
-Expect roughly **low single digits up to ~10 t/s** for a 14B model on
-CPU, depending on your processor — a 5-15x slowdown from GPU is typical,
-so this isn't meant to be usable for interactive chat, just a concrete
-reference point. Memory footprint (~9GB for this model's Q4_K_M weights)
-should sit comfortably inside 64GB, so RAM capacity isn't the constraint
-here — generation speed is. Compare this number directly against your GPU
-baseline from D.1 any time you're unsure whether offload actually
-happened.
+If a task keeps landing in the "never trust as final" tier often enough
+to be annoying, that's a signal to reach for a larger model (even a
+pay-as-you-go API call for just that one verification) rather than adding
+another rule to Appendix A — twelve-plus rules deep is already past the
+point of reliable diminishing returns for a model this size.
