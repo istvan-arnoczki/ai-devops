@@ -149,6 +149,26 @@ curl "http://localhost:8888/search?q=test&format=json"
 You should get a JSON body starting with `{"query": "test", ...}`, not
 `<!DOCTYPE html>`.
 
+## 0.4 Two different model lists in Open WebUI — don't confuse them
+
+Once either engine is connected, you'll notice **the chat dropdown** (top
+of a chat window) lists every raw model the connection exposes — e.g.
+`quick`, `power`, `power-reasoning`, `power-30b`, or `qwen3:14b` directly —
+while **Workspace → Models** only lists custom models you've explicitly
+built there via the `+` flow. This is intentional, not a bug: Workspace →
+Models is a page for your saved presets (system prompt + params bundled
+together), not a catalog of every model a connection happens to expose.
+
+**This matters practically**: if you pick a raw base model straight from
+the chat dropdown (`power`, `qwen3:14b`, etc.) instead of one of your
+custom models (`DevOps Assistant (docs-first)`, etc.), you get **no
+system prompt at all** — no `[DOCS]`/`[WEB]` tagging, no priority-domain
+search behavior, none of Appendix A's rules. It'll still generate
+answers, just without any of the docs-first grounding this whole setup is
+for. Always select your custom model, not the raw base model, for actual
+use — the raw entries are only useful for the standalone testing/tuning
+commands elsewhere in this guide (pre-warming, benchmarking, etc.).
+
 ---
 
 # Part 1 — llama-swap (recommended engine)
@@ -779,7 +799,22 @@ Your Open WebUI version likely exposes a broad "agent OS" capability set
 assistant needs. More enabled tools means more chances the model picks the
 wrong one — trim aggressively:
 
-**Check:** Web Search (Capabilities + Default Features), Citations, File
+**Web Search specifically appears in three separate places, and they are
+not the same toggle:**
+- **Capabilities → Web Search** — mostly a capability indicator/badge.
+- **Default Features → Web Search** — the classic behavior: Open WebUI
+  automatically runs a search before every message and injects results
+  into context, independent of the model deciding anything.
+- **Builtin Tools → Web Search** — registers `web_search` as an actual
+  **callable function** for native tool-calling.
+
+With `Function Calling: Native` set (as this whole guide uses), the model
+needs a real callable tool — that only comes from **Builtin Tools**. If
+only the first two are checked, native mode has nothing to call, and the
+model will accurately say it can't access the internet rather than
+hallucinating — check **all three**, not just the top two.
+
+**Check:** Web Search (all three locations above), Citations, File
 Upload, File Context, Status Updates, Chat History, Time & Calculation,
 Files.
 
