@@ -251,7 +251,7 @@ docker compose up -d searxng llama-swap
 docker exec -it llama-swap nvidia-smi   # confirm GPU is visible
 ```
 
-## 1.4 config.yaml — the reasoning model, plus a fast one for sgpt
+## 1.4 config.yaml — reasoning model, sgpt's fast model, and autocomplete
 
 `./data/llama-swap/config.yaml`:
 
@@ -289,6 +289,25 @@ models:
       --cache-type-k q8_0
       --cache-type-v q8_0
     ttl: 300
+
+  "autocomplete":
+    cmd: |
+      llama-server
+      -hf Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF:Q4_K_M
+      --port ${PORT}
+      --host 0.0.0.0
+      --ctx-size 4096
+      --n-gpu-layers 99
+      --flash-attn on
+    ttl: 300
+
+groups:
+  "concurrent":
+    swap: false
+    exclusive: false
+    members:
+      - "assistant"
+      - "autocomplete"
 ```
 
 Notes:
@@ -308,33 +327,57 @@ Notes:
   or getting stuck), so this isn't a stylistic choice, it's required
   given reasoning is always on for that model.
 - Thinking mode itself is controlled by `/think` in the system prompt
-  (Appendix A), not a CLI flag — there isn't one. `quick` has no `/think`
-  and no thinking-tuned sampling — it's the plain fast-lookup path, not a
-  second reasoning model.
-- `quick` is only wired into `sgpt`, not Open WebUI — Open WebUI still
-  has exactly one model (`assistant`), consistent with the rest of this
-  guide. This is purely a CLI-speed accommodation for when `/think`'s
-  latency is more than you want for a quick terminal lookup.
-- `--ctx-size 16384` on `assistant` — raise this if thinking traces get
-  truncated on complex questions (there's VRAM headroom, since `quick`
-  and `assistant` are never loaded simultaneously — see 1.5).
+  (Appendix A), not a CLI flag — there isn't one. `quick` and
+  `autocomplete` have no `/think` and no thinking-tuned sampling.
+- `quick` is only wired into `sgpt`, not Open WebUI or VS Code — a
+  CLI-speed accommodation for when `/think`'s latency is more than you
+  want for a quick terminal lookup.
+- `autocomplete` (`Qwen2.5-Coder-1.5B-Instruct`) is Continue's own current
+  documented recommendation for local autocomplete (confirmed across
+  multiple current `docs.continue.dev` pages) — not `starcoder2:3b`,
+  which was an older recommendation from an earlier version of their
+  docs. It's small (~0.9GB at Q4_K_M) and, per Qwen's own model card,
+  retains strong fill-in-the-middle capability despite being the
+  instruct-tuned variant. It's only wired into VS Code's `autocomplete`
+  role (1.8), not `sgpt` or Open WebUI.
+- **`Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF`** is the official Qwen org
+  GGUF repo — verified directly against Qwen's own quickstart README, not
+  a third-party conversion, so no build-recency/pre-tokenizer concerns
+  like the earlier `starcoder2-3b` situation.
+- **The `groups` block is what keeps `assistant` and `autocomplete`
+  loaded simultaneously** instead of llama-swap's default swap-on-demand
+  behavior — without it, every autocomplete keystroke after a chat
+  message (or vice versa) would trigger a multi-second reload, which is
+  a genuinely bad experience for something that's supposed to feel
+  instant. `quick` is deliberately left out of the group — it's only
+  used interactively via `sgpt`, never alongside the other two in the
+  same moment, so it doesn't need to coexist in VRAM with them.
+- **VRAM math is comfortable here**, unlike the earlier `starcoder2-3b`
+  estimate — roughly ~10–11GB for `assistant` plus ~1.2–1.5GB for
+  `autocomplete` (a 1.5B model, not 3B) on a 12GB card. Worth confirming
+  for real anyway (`docker exec -it llama-swap nvidia-smi` while both are
+  loaded) rather than fully trusting the estimate, but the margin is
+  meaningfully better than the earlier model choice. If it's ever tight,
+  lower `assistant`'s `--ctx-size` from `16384` toward `12288` first —
+  biggest single lever, trims KV cache directly.
 
 Apply:
 ```bash
 docker compose up -d llama-swap
 ```
 
-## 1.5 Pre-warm both models before using them
+## 1.5 Pre-warm all three models before using them
 
 **Models download lazily on first generation request, not at container
 startup.** The first request simultaneously spawns the process,
 downloads the GGUF from Hugging Face, loads it into VRAM, then generates
 — which commonly exceeds Open WebUI's or llama-swap's own
 `healthCheckTimeout` and shows up as a generic error rather than an
-obvious "still downloading" message. Pre-warm both once:
+obvious "still downloading" message. Pre-warm all three once:
 ```bash
 docker exec -it llama-swap llama-server -hf Qwen/Qwen3-14B-GGUF:Q4_K_M --port 9999
 docker exec -it llama-swap llama-server -hf Qwen/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M --port 9999
+docker exec -it llama-swap llama-server -hf Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF:Q4_K_M --port 9999
 ```
 Let each run until you see a "server listening" message, then `Ctrl+C`.
 The GGUF files are now cached under `./data/llama-cpp/models` —
@@ -393,6 +436,7 @@ CACHE_LENGTH=100
 CACHE_PATH=/tmp/shell_gpt/cache
 REQUEST_TIMEOUT=60
 DEFAULT_COLOR=magenta
+CODE_THEME=dracula
 DISABLE_STREAMING=false
 PRETTIFY_MARKDOWN=true
 SHELL_INTERACTION=true
@@ -404,6 +448,14 @@ EOF
 shell-gpt doesn't read `OPENAI_API_BASE`-style env vars for this, and
 setting only env vars silently falls through to OpenAI's real endpoint
 and fails with a 401.
+
+`CODE_THEME` controls syntax-highlighting colors for rendered code blocks
+(standard Pygments theme names — `dracula`, `monokai`, `github-dark`,
+etc.), separate from `DEFAULT_COLOR`'s flat text color. Note that
+markdown/syntax-highlight rendering depends on the *role's* type, not
+just `PRETTIFY_MARKDOWN` — a custom role can suppress it regardless of
+this setting, which is why every `--role` example below includes an
+explicit `--md` flag to force rendering on.
 
 Create the adapted role interactively (prefer the CLI flow over
 hand-writing the role file — same reasoning as avoiding the Open WebUI
@@ -418,7 +470,7 @@ anti-fabrication discipline).
 
 Use it:
 ```bash
-sgpt --role devops "explain this renovate.json error: <paste>"
+sgpt --role devops --md "explain this renovate.json error: <paste>"
 ```
 Since there's no live search in this context, treat any specific
 option/flag name it states as something to verify yourself — the role's
@@ -442,12 +494,123 @@ sgpt --create-role devops-quick
 paste Appendix A.2 but remove the `/think` line (there's no reasoning
 mode to enable on this model), then use:
 ```bash
-sgpt --model quick --role devops-quick "..."
+sgpt --model quick --role devops-quick --md "..."
 ```
 `DEFAULT_MODEL=assistant` in `.sgptrc` stays as your default for anything
 you'd type without a flag — `--model quick` is an explicit, deliberate
 opt-out for a single call, not a config-wide switch.
-self-assessment of its own certainty is not fully reliable either.
+
+### Give sgpt real web search instead of the honestly-hedged offline prompt
+
+The `devops` role above (Appendix A.2) exists because `sgpt` has no
+built-in mechanism to execute a tool call. That's fixable — `shell-gpt`
+has a genuine function-calling feature, letting you give it a real
+Python function the model can actually invoke. Once this is set up,
+`sgpt` gets the same live-search capability as Open WebUI, not just the
+same weights.
+
+**Install dependencies:**
+```bash
+pip install instructor requests --break-system-packages
+```
+
+**Create the function file** — `~/.config/shell_gpt/functions/search_web.py`:
+```python
+import requests
+from pydantic import Field
+from instructor import OpenAISchema
+
+
+class Function(OpenAISchema):
+    """
+    Searches the web via a local SearXNG instance and returns the top
+    results (title, URL, snippet) as plain text. Use this whenever you
+    need current information, official documentation, or anything you
+    cannot answer confidently from training knowledge alone.
+    """
+    query: str = Field(..., description="The search query to run")
+
+    class Config:
+        title = "search_web"
+
+    @classmethod
+    def execute(cls, query: str) -> str:
+        try:
+            resp = requests.get(
+                "http://localhost:8888/search",
+                params={"q": query, "format": "json"},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            return f"Search failed: {e}"
+
+        results = data.get("results", [])[:5]
+        if not results:
+            return "No results found."
+
+        lines = []
+        for r in results:
+            title = r.get("title", "")
+            url = r.get("url", "")
+            content = r.get("content", "")
+            lines.append(f"- {title}\n  URL: {url}\n  {content}")
+        return "\n\n".join(lines)
+```
+Note it hits `localhost:8888`, not the Docker-internal `searxng:8080` —
+`sgpt` runs on the host, not inside the compose network, same reasoning
+as `.sgptrc`'s `API_BASE_URL` pointing at `localhost:8090`.
+
+**Deliberately do not run** `sgpt --install-functions` — that installs
+shell-gpt's own default functions, including one that lets the model
+execute arbitrary shell commands on your system. That's real command
+execution capability, and it's out of scope here for the same reason
+Open WebUI's "Terminal" capability is unchecked in Appendix A.1. Only
+the search function above goes in.
+
+**Enable function calling** — add to `~/.config/shell_gpt/.sgptrc`:
+```
+OPENAI_USE_FUNCTIONS=true
+SHOW_FUNCTIONS_OUTPUT=true
+```
+`SHOW_FUNCTIONS_OUTPUT=true` is worth keeping on — it shows you when the
+model actually calls `search_web` and what came back, which is exactly
+how you'll confirm this is really working rather than silently not
+firing.
+
+**Create the real-search role** — same idea as before, but now paste
+**Appendix A.3** (functionally the same prompt as Open WebUI's, since the
+"no tool access" caveat from A.2 no longer applies):
+```bash
+sgpt --create-role devops-search
+```
+
+**Test it** — this is unverified until you run it for real (I can't
+execute `shell_gpt`/`instructor` in my own environment, so treat this as
+a first draft to debug against, not a guarantee):
+```bash
+sgpt --role devops-search --md "what does renovate's managerFilePatterns option do"
+```
+With `SHOW_FUNCTIONS_OUTPUT=true`, you should see the function call and
+its raw SearXNG results printed before the final answer. If it errors
+instead:
+- A Python traceback naming `instructor` or `pydantic` → likely a version
+  mismatch between what's installed and what this schema expects; check
+  `pip show instructor` and the current example in shell-gpt's own README
+  function-calling section, since the exact base class/decorator pattern
+  has shifted across shell-gpt versions before.
+- The model responds but never calls the function → confirm
+  `OPENAI_USE_FUNCTIONS=true` actually saved, and that `--jinja` is still
+  present on the `assistant` model in `config.yaml` (same tool-calling
+  requirement as the Open WebUI path).
+- `Search failed: ...` in the output → SearXNG isn't reachable at
+  `localhost:8888` from the host; re-run the `curl` test from 0.3.
+
+Once this is confirmed working, `--role devops` (A.2) becomes optional —
+keep it around as a fallback for if SearXNG or the function ever breaks
+and you still want a usable, honestly-hedged CLI assistant in the
+meantime.
 
 ## 1.8 Connect VS Code (Continue extension)
 
@@ -466,15 +629,47 @@ models:
     roles:
       - chat
       - edit
+
+  - name: Local Autocomplete (llama-swap)
+    provider: openai
+    model: autocomplete
+    apiBase: http://localhost:8090/v1
+    apiKey: sk-local-no-auth
+    roles:
+      - autocomplete
+    promptTemplates:
+      autocomplete: "<|fim_prefix|>{{{prefix}}}<|fim_suffix|>{{{suffix}}}<|fim_middle|>"
 ```
 
-**Deliberately no `autocomplete` role here.** Thinking mode adds a hidden
-reasoning trace before every response, including trivial ones — fine for
-a chat question, actively bad for inline autocomplete, which needs to
-feel instant. If you want autocomplete too, it would need a second,
-non-thinking model entry, which is outside the "one model" scope of this
-setup — flagging the trade-off rather than silently degrading
-autocomplete UX or silently expanding scope back to multiple models.
+`autocomplete` now points at `Qwen2.5-Coder-1.5B-Instruct` (1.4) — a
+fill-in-the-middle-capable model, not `assistant`. Thinking mode adds a
+hidden reasoning trace before every response, which is fine for a chat
+question but was actively bad for inline completions needing to feel
+instant — that's why `assistant` was deliberately excluded from this role
+earlier, and why a second model exists specifically for it rather than
+compromising either one. This only works as configured because 1.4's
+`groups` block keeps both loaded in VRAM at once — without it, every
+completion after a chat message would trigger a multi-second reload.
+
+**The explicit `promptTemplates.autocomplete` block matters, don't skip
+it.** Continue normally infers the correct FIM prompt template from the
+model name string — but that inference is documented to specifically key
+off known Ollama model tags, and our `model:` field here is `autocomplete`
+(a llama-swap alias), going through a generic `provider: openai`
+connection rather than `provider: ollama`. If that inference doesn't
+fire correctly for this setup, completions come back missing their FIM
+special tokens entirely — garbled or nonsensical output that looks like
+a broken model, when it's actually a template-detection mismatch.
+Setting the template explicitly, sourced directly from Continue's own
+documented example for this exact model, sidesteps the guesswork
+entirely rather than hoping name-based detection works with a
+non-Ollama provider.
+
+**Windows note**: on `C:\Users\<user>\.continue\config.yaml` (PowerShell), not
+the WSL path, if VS Code isn't connected via Remote-WSL — and double-check
+for a stray `config.ts` in the same folder, which can silently override
+`config.yaml` for the autocomplete pipeline specifically even when the
+chat pipeline reads it fine.
 
 ## 1.9 Verify end-to-end
 
